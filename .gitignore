@@ -3,8 +3,8 @@ dist/
 .env
 data/*.db
 data/*.db-*
-images/
-logs/
+/images/
+/logs/
 *.log
 .DS_Store
 playwright-report/
