@@ -1,12 +1,14 @@
 import { getSourceConfig } from "../config/index.js";
 import type { GameImageSource } from "./SourceAdapter.js";
 import { stakeSource } from "./stake/index.js";
+import { slotsjudgeSource } from "./slotsjudge/index.js";
 import { bitcasinoSource } from "./bitcasino/index.js";
 import { slotcatalogSource } from "./slotcatalog/index.js";
 import { casinoguruSource } from "./casinoguru/index.js";
 
 const adapters: GameImageSource[] = [
   stakeSource,
+  slotsjudgeSource,
   bitcasinoSource,
   slotcatalogSource,
   casinoguruSource,

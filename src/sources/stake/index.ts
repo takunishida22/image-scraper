@@ -108,20 +108,80 @@ function toSearchResult(node: StakeGameNode, baseUrl: string): SearchResult | nu
   };
 }
 
-function stakeHeaders(): Record<string, string> {
+const DEFAULT_STAKE_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+
+function stakeUserAgent(): string {
+  return config.stake.userAgent || DEFAULT_STAKE_UA;
+}
+
+function stakeCookieHeader(): string {
+  const extra = config.stake.cookies.trim();
+  const cf = config.stake.cfClearance.trim();
+  if (extra && /(^|;\s*)cf_clearance=/.test(extra)) return extra;
+  if (extra && cf) return `${extra}; cf_clearance=${cf}`;
+  if (extra) return extra;
+  if (cf) return `cf_clearance=${cf}`;
+  return "";
+}
+
+function stakeHeaders(kind: "json" | "html" = "json"): Record<string, string> {
   const headers: Record<string, string> = {
-    "content-type": "application/json",
-    accept: "application/json",
+    "user-agent": stakeUserAgent(),
+    "accept-language": "en-US,en;q=0.9",
     origin: config.stake.baseUrl,
     referer: `${config.stake.baseUrl}/casino/home`,
   };
-  if (config.stake.accessToken) {
-    headers["x-access-token"] = config.stake.accessToken;
+  if (kind === "json") {
+    headers["content-type"] = "application/json";
+    headers.accept = "application/json";
+  } else {
+    headers.accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
   }
-  if (config.stake.cfClearance) {
-    headers.cookie = `cf_clearance=${config.stake.cfClearance}`;
-  }
+  const cookie = stakeCookieHeader();
+  if (cookie) headers.cookie = cookie;
+  if (config.stake.accessToken) headers["x-access-token"] = config.stake.accessToken;
   return headers;
+}
+
+function stakePlaywrightCookies(): Array<{
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  secure: boolean;
+}> {
+  const header = stakeCookieHeader();
+  if (!header) return [];
+  const host = new URL(config.stake.baseUrl).hostname;
+  const domain = host.startsWith(".") ? host : `.${host}`;
+  return header
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const eq = pair.indexOf("=");
+      return {
+        name: eq === -1 ? pair : pair.slice(0, eq),
+        value: eq === -1 ? "" : pair.slice(eq + 1),
+        domain,
+        path: "/",
+        secure: true,
+      };
+    });
+}
+
+function blockedHint(detail: string): string {
+  if (config.stake.cfClearance || config.stake.cookies) {
+    return (
+      `Stake still blocked (${detail}). cf_clearance is bound to the IP + User-Agent that solved Cloudflare. ` +
+      `This host IP is likely different from the browser that minted the cookie. Set STAKE_USER_AGENT to that exact UA, ` +
+      `run the scraper from the same IP, or use STAKE_PROXY. x-access-token is not required for casino GraphQL search.`
+    );
+  }
+  return (
+    `Stake HTTP/GraphQL unavailable (${detail}). Set STAKE_CF_CLEARANCE minted on this same IP with matching STAKE_USER_AGENT, or STAKE_PROXY.`
+  );
 }
 
 async function graphql<T = Record<string, unknown>>(
@@ -271,20 +331,11 @@ class StakeBrowserPool {
           proxy: config.stake.proxy ? { server: config.stake.proxy } : undefined,
         });
         this.context = await this.browser.newContext({
-          userAgent:
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          userAgent: stakeUserAgent(),
           locale: "en-US",
         });
-        if (config.stake.cfClearance) {
-          await this.context.addCookies([
-            {
-              name: "cf_clearance",
-              value: config.stake.cfClearance,
-              domain: new URL(config.stake.baseUrl).hostname,
-              path: "/",
-            },
-          ]);
-        }
+        const cookies = stakePlaywrightCookies();
+        if (cookies.length) await this.context.addCookies(cookies);
       })();
     }
     await this.launching;
@@ -332,6 +383,7 @@ async function ensureTransport(): Promise<"http" | "playwright"> {
       proxy: config.stake.proxy || undefined,
       retries: 0,
       label: "stake-probe",
+      headers: stakeHeaders("html"),
     });
     httpAvailable = true;
     playwrightNeeded = false;
@@ -346,12 +398,12 @@ async function ensureTransport(): Promise<"http" | "playwright"> {
       httpAvailable = true;
       playwrightNeeded = false;
       return "http";
-    } catch {
+    } catch (gqlErr) {
       httpAvailable = false;
       playwrightNeeded = true;
-      logger.warn(
-        "Stake HTTP/GraphQL unavailable (Cloudflare or geo-block); Playwright fallback enabled. Set STAKE_CF_CLEARANCE / STAKE_ACCESS_TOKEN or STAKE_PROXY if needed.",
-      );
+      const detail =
+        gqlErr instanceof HttpError ? `HTTP ${gqlErr.status}` : (gqlErr as Error).message;
+      logger.warn(blockedHint(detail));
       return "playwright";
     }
   }
@@ -384,14 +436,11 @@ async function searchViaPlaywright(game: GameRecord): Promise<SearchResult[]> {
 
     const blocked = await pageLooksBlocked(page);
     if (blocked) {
-      throw new Error(
-        `stake_blocked:${blocked}. Provide STAKE_PROXY and/or STAKE_CF_CLEARANCE + STAKE_ACCESS_TOKEN for this network.`,
-      );
+      throw new Error(`stake_blocked:${blocked}. ${blockedHint(blocked)}`);
     }
 
     const slug = slugifyGameName(game.name);
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (config.stake.accessToken) headers["x-access-token"] = config.stake.accessToken;
+    const headers = stakeHeaders("json");
 
     for (const q of SEARCH_QUERIES) {
       const variables = q.name === "SlugCasinoGame" ? { slug } : { query: game.name };
@@ -527,11 +576,7 @@ export const stakeSource: GameImageSource = {
       const transport = await ensureTransport();
       httpWorks = transport === "http";
       playwrightRequired = transport === "playwright";
-      notes.push(
-        httpWorks
-          ? "HTTP/GraphQL reachable"
-          : "HTTP blocked; set STAKE_CF_CLEARANCE / STAKE_ACCESS_TOKEN or use proxy",
-      );
+      notes.push(httpWorks ? "HTTP/GraphQL reachable" : blockedHint("cloudflare"));
     } catch (err) {
       httpWorks = false;
       playwrightRequired = true;
@@ -566,6 +611,7 @@ export const stakeSource: GameImageSource = {
         const html = await fetchText(result.url, {
           proxy: config.stake.proxy || undefined,
           label: "stake-game-page",
+          headers: stakeHeaders("html"),
         });
         return {
           title: result.title,

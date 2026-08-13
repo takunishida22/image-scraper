@@ -2,7 +2,7 @@ import { config as loadDotenv } from "dotenv";
 import path from "node:path";
 import type { ExpectedRatio, ImageType } from "../types.js";
 
-loadDotenv();
+loadDotenv({ override: true });
 
 function envString(key: string, fallback = ""): string {
   const value = process.env[key];
@@ -62,6 +62,8 @@ export interface AppConfig {
     baseUrl: string;
     accessToken: string;
     cfClearance: string;
+    cookies: string;
+    userAgent: string;
     concurrency: number;
     proxy: string;
   };
@@ -101,21 +103,27 @@ export const config: AppConfig = {
       proxy: envString("STAKE_PROXY"),
       enabled: true,
     },
-    bitcasino: {
+    slotsjudge: {
       expectedRatio: "unknown",
       priority: 2,
+      concurrency: envInt("SLOTSJUDGE_CONCURRENCY", 4),
+      enabled: true,
+    },
+    bitcasino: {
+      expectedRatio: "unknown",
+      priority: 3,
       concurrency: 5,
       enabled: true,
     },
     slotcatalog: {
       expectedRatio: "unknown",
-      priority: 3,
+      priority: 4,
       concurrency: 10,
       enabled: true,
     },
     casinoguru: {
       expectedRatio: "unknown",
-      priority: 4,
+      priority: 5,
       concurrency: 5,
       enabled: true,
     },
@@ -124,6 +132,8 @@ export const config: AppConfig = {
     baseUrl: envString("STAKE_BASE_URL", "https://stake.com").replace(/\/$/, ""),
     accessToken: envString("STAKE_ACCESS_TOKEN"),
     cfClearance: envString("STAKE_CF_CLEARANCE"),
+    cookies: envString("STAKE_COOKIES"),
+    userAgent: envString("STAKE_USER_AGENT"),
     concurrency: envInt("STAKE_CONCURRENCY", 3),
     proxy: envString("STAKE_PROXY"),
   },

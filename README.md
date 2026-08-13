@@ -22,6 +22,8 @@ npm test
 
 ```bash
 npm run import -- ./data/games.csv
+npm run analyze-source -- --source slotsjudge --limit 5
+npm run scrape -- --source slotsjudge --limit 50
 npm run analyze-source -- --source stake --limit 50
 npm run scrape -- --source stake --missing-only --limit 50
 npm run scrape -- --type portrait --missing-only
@@ -41,12 +43,32 @@ images/<slug>__<gameId>/<ratio>.<ext>
 
 `ext` comes from actual image bytes (Sharp metadata), not the remote URL.
 
+## SlotsJudge (default reachable source)
+
+`slotsjudge.com` is reachable from datacenter IPs. Use it when Stake is Cloudflare-blocked:
+
+```bash
+npm run scrape -- --source slotsjudge --limit 50
+```
+
+Artwork is mostly landscape gameplay / key art, not Stake lobby portraits. Omit `--type portrait` so landscape images can be saved.
+
 ## Stake notes
 
-Stake is often behind Cloudflare. Prefer HTTP/GraphQL; Playwright is a reused-browser fallback. On blocked networks set:
+Stake is behind Cloudflare. Casino search uses public GraphQL (`/_api/graphql`) — **`STAKE_ACCESS_TOKEN` is not required**.
+
+`STAKE_CF_CLEARANCE` only works when **all** of these match the browser that solved Cloudflare:
+
+1. The **same public IP** that runs the scraper
+2. The **same User-Agent** (`STAKE_USER_AGENT`)
+3. A cookie that has not expired
+
+A cookie copied from your laptop will not work on this VPS. Either run the scraper on that laptop, or set `STAKE_PROXY` so traffic exits an allowed IP.
 
 ```env
-STAKE_PROXY=
 STAKE_CF_CLEARANCE=
+STAKE_USER_AGENT=
+STAKE_COOKIES=
+STAKE_PROXY=
 STAKE_ACCESS_TOKEN=
 ```
