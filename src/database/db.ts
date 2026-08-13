@@ -7,6 +7,8 @@ import type {
   GameRecord,
   GameStatus,
   ImageType,
+  SourceAttemptRecord,
+  SourceAttemptStatus,
   SourceStats,
 } from "../types.js";
 import { normalizeGameName } from "../core/normalizer.js";
@@ -37,6 +39,8 @@ function mapGame(row: Record<string, unknown>): GameRecord {
 }
 
 function mapImage(row: Record<string, unknown>): GameImageRecord {
+  const gameMatchScore = Number(row.game_match_score ?? row.confidence ?? 0);
+  const imageCandidateScore = Number(row.image_candidate_score ?? 0);
   return {
     id: Number(row.id),
     gameId: Number(row.game_id),
@@ -48,8 +52,25 @@ function mapImage(row: Record<string, unknown>): GameImageRecord {
     fileSize: Number(row.file_size),
     source: String(row.source),
     sha256: String(row.sha256),
-    confidence: Number(row.confidence),
+    confidence: gameMatchScore,
+    gameMatchScore,
+    imageCandidateScore,
     createdAt: String(row.created_at),
+  };
+}
+
+function mapAttempt(row: Record<string, unknown>): SourceAttemptRecord {
+  return {
+    id: Number(row.id),
+    gameId: Number(row.game_id),
+    source: String(row.source),
+    targetType: String(row.target_type),
+    status: String(row.status) as SourceAttemptStatus,
+    attemptCount: Number(row.attempt_count),
+    lastError: row.last_error == null ? null : String(row.last_error),
+    lastAttemptAt: row.last_attempt_at == null ? null : String(row.last_attempt_at),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
   };
 }
 
@@ -98,7 +119,7 @@ export function listGames(options: {
   status?: GameStatus | GameStatus[];
   limit?: number;
   missingType?: ImageType;
-  sourceAttemptFilter?: never;
+  ids?: number[];
 } = {}): GameRecord[] {
   const database = getDb();
   const clauses: string[] = [];
@@ -118,6 +139,11 @@ export function listGames(options: {
        )`,
     );
     params.push(options.missingType);
+  }
+
+  if (options.ids?.length) {
+    clauses.push(`id IN (${options.ids.map(() => "?").join(",")})`);
+    params.push(...options.ids);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
@@ -141,12 +167,20 @@ export function updateGameStatus(id: number, status: GameStatus): void {
 }
 
 export function recoverStaleProcessing(): number {
-  const result = getDb()
+  const database = getDb();
+  const games = database
     .prepare(
       "UPDATE games SET status = 'pending', updated_at = datetime('now') WHERE status = 'processing'",
     )
     .run();
-  return Number(result.changes ?? 0);
+  database
+    .prepare(
+      `UPDATE source_attempts
+       SET status = 'pending', updated_at = datetime('now')
+       WHERE status = 'processing'`,
+    )
+    .run();
+  return Number(games.changes ?? 0);
 }
 
 export function getImagesForGame(gameId: number): GameImageRecord[] {
@@ -180,11 +214,16 @@ export function upsertGameImage(input: {
   fileSize: number;
   source: string;
   sha256: string;
-  confidence: number;
+  gameMatchScore: number;
+  imageCandidateScore: number;
+  /** @deprecated */
+  confidence?: number;
   overwrite?: boolean;
 }): { saved: boolean; reason?: string; record?: GameImageRecord } {
   const database = getDb();
   const existing = getImageByType(input.gameId, input.imageType);
+  const gameMatchScore = input.gameMatchScore ?? input.confidence ?? 0;
+  const imageCandidateScore = input.imageCandidateScore ?? 0;
 
   if (existing && !input.overwrite) {
     const existingPixels = existing.width * existing.height;
@@ -199,7 +238,8 @@ export function upsertGameImage(input: {
       .prepare(
         `UPDATE game_images
          SET local_path = ?, width = ?, height = ?, format = ?, file_size = ?,
-             source = ?, sha256 = ?, confidence = ?, created_at = datetime('now')
+             source = ?, sha256 = ?, confidence = ?, game_match_score = ?,
+             image_candidate_score = ?, created_at = datetime('now')
          WHERE id = ?`,
       )
       .run(
@@ -210,15 +250,18 @@ export function upsertGameImage(input: {
         input.fileSize,
         input.source,
         input.sha256,
-        input.confidence,
+        gameMatchScore,
+        gameMatchScore,
+        imageCandidateScore,
         existing.id,
       );
   } else {
     database
       .prepare(
         `INSERT INTO game_images
-         (game_id, image_type, local_path, width, height, format, file_size, source, sha256, confidence, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+         (game_id, image_type, local_path, width, height, format, file_size, source, sha256,
+          confidence, game_match_score, image_candidate_score, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
       )
       .run(
         input.gameId,
@@ -230,7 +273,9 @@ export function upsertGameImage(input: {
         input.fileSize,
         input.source,
         input.sha256,
-        input.confidence,
+        gameMatchScore,
+        gameMatchScore,
+        imageCandidateScore,
       );
   }
 
@@ -238,6 +283,9 @@ export function upsertGameImage(input: {
   return { saved: true, record: record ?? undefined };
 }
 
+/**
+ * Derive game status from collected images only (not from a single source failure).
+ */
 export function refreshGameCompletionStatus(gameId: number): GameStatus {
   const images = getImagesForGame(gameId);
   const types = new Set(images.map((i) => i.imageType));
@@ -252,6 +300,110 @@ export function refreshGameCompletionStatus(gameId: number): GameStatus {
 
   updateGameStatus(gameId, status);
   return status;
+}
+
+export function upsertSourceAttempt(input: {
+  gameId: number;
+  source: string;
+  targetType: string;
+  status: SourceAttemptStatus;
+  lastError?: string | null;
+  incrementAttempt?: boolean;
+}): SourceAttemptRecord {
+  const database = getDb();
+  database
+    .prepare(
+      `INSERT INTO source_attempts (game_id, source, target_type, status, attempt_count, last_error, last_attempt_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 0, NULL, NULL, datetime('now'), datetime('now'))
+       ON CONFLICT(game_id, source, target_type) DO NOTHING`,
+    )
+    .run(input.gameId, input.source, input.targetType, input.status);
+
+  if (input.incrementAttempt) {
+    database
+      .prepare(
+        `UPDATE source_attempts
+         SET status = ?, last_error = ?, attempt_count = attempt_count + 1,
+             last_attempt_at = datetime('now'), updated_at = datetime('now')
+         WHERE game_id = ? AND source = ? AND target_type = ?`,
+      )
+      .run(
+        input.status,
+        input.lastError ?? null,
+        input.gameId,
+        input.source,
+        input.targetType,
+      );
+  } else {
+    database
+      .prepare(
+        `UPDATE source_attempts
+         SET status = ?, last_error = ?, last_attempt_at = datetime('now'), updated_at = datetime('now')
+         WHERE game_id = ? AND source = ? AND target_type = ?`,
+      )
+      .run(
+        input.status,
+        input.lastError ?? null,
+        input.gameId,
+        input.source,
+        input.targetType,
+      );
+  }
+
+  const row = database
+    .prepare(
+      `SELECT * FROM source_attempts WHERE game_id = ? AND source = ? AND target_type = ?`,
+    )
+    .get(input.gameId, input.source, input.targetType) as Record<string, unknown>;
+  return mapAttempt(row);
+}
+
+export function listFailedSourceAttempts(options: {
+  source?: string;
+  targetType?: string;
+  limit?: number;
+}): SourceAttemptRecord[] {
+  const clauses: string[] = [`status IN ('failed', 'not_found')`];
+  const params: Array<string | number> = [];
+  if (options.source) {
+    clauses.push("source = ?");
+    params.push(options.source);
+  }
+  if (options.targetType) {
+    clauses.push("target_type = ?");
+    params.push(options.targetType);
+  }
+  const limit = options.limit ? `LIMIT ${Number(options.limit)}` : "";
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM source_attempts WHERE ${clauses.join(" AND ")} ORDER BY id ASC ${limit}`,
+    )
+    .all(...params) as Record<string, unknown>[];
+  return rows.map(mapAttempt);
+}
+
+export function resetSourceAttemptsToPending(options: {
+  source?: string;
+  targetType?: string;
+}): number {
+  const clauses: string[] = [`status IN ('failed', 'not_found', 'review')`];
+  const params: string[] = [];
+  if (options.source) {
+    clauses.push("source = ?");
+    params.push(options.source);
+  }
+  if (options.targetType) {
+    clauses.push("target_type = ?");
+    params.push(options.targetType);
+  }
+  const result = getDb()
+    .prepare(
+      `UPDATE source_attempts
+       SET status = 'pending', updated_at = datetime('now')
+       WHERE ${clauses.join(" AND ")}`,
+    )
+    .run(...params);
+  return Number(result.changes ?? 0);
 }
 
 export function bumpSourceStat(
@@ -329,24 +481,25 @@ export function getOverallStats() {
   );
 
   const review = Number(
-    (database.prepare("SELECT COUNT(*) AS c FROM games WHERE status = 'review'").get() as { c: number })
-      .c,
+    (
+      database
+        .prepare(
+          `SELECT COUNT(*) AS c FROM source_attempts WHERE status = 'review'`,
+        )
+        .get() as { c: number }
+    ).c,
   );
   const failed = Number(
-    (database.prepare("SELECT COUNT(*) AS c FROM games WHERE status = 'failed'").get() as { c: number })
-      .c,
+    (
+      database
+        .prepare(
+          `SELECT COUNT(*) AS c FROM source_attempts WHERE status = 'failed'`,
+        )
+        .get() as { c: number }
+    ).c,
   );
 
   return { total, portrait, square, landscape, allThree, missingAll, review, failed };
-}
-
-export function resetFailedToPending(): number {
-  const result = getDb()
-    .prepare(
-      "UPDATE games SET status = 'pending', updated_at = datetime('now') WHERE status = 'failed'",
-    )
-    .run();
-  return Number(result.changes ?? 0);
 }
 
 export function closeDb(): void {
@@ -354,4 +507,9 @@ export function closeDb(): void {
     db.close();
     db = null;
   }
+}
+
+/** Test helper: point DB at a fresh file and reopen. */
+export function resetDbConnection(): void {
+  closeDb();
 }

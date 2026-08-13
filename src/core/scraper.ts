@@ -2,47 +2,62 @@ import { config, getSourceConfig, sourcesForType } from "../config/index.js";
 import {
   bumpSourceStat,
   getImageByType,
+  listFailedSourceAttempts,
   listGames,
   recoverStaleProcessing,
   refreshGameCompletionStatus,
-  updateGameStatus,
+  resetSourceAttemptsToPending,
+  upsertSourceAttempt,
 } from "../database/db.js";
 import { downloadAndStoreImage } from "../images/downloader.js";
-import { decideMatch, scoreImageCandidate, scoreSearchMatch } from "./matcher.js";
+import { decideMatch, rankImageCandidates, scoreSearchMatch } from "./matcher.js";
 import { createLimiter } from "./queue.js";
 import { getSource, listSources } from "../sources/registry.js";
 import type { GameImageSource } from "../sources/SourceAdapter.js";
 import type { GameRecord, ImageType, ScrapeOptions, SearchResult } from "../types.js";
 import { logFailedGame, logReviewNeeded, logger } from "../utils/logger.js";
 
+function resolveDesiredType(
+  targetType: ImageType | undefined,
+  source: GameImageSource,
+): ImageType | undefined {
+  if (targetType) return targetType;
+  const expected = source.expectedRatio;
+  if (expected && expected !== "unknown" && expected !== "other") {
+    return expected;
+  }
+  return undefined;
+}
+
 function resolveSources(options: ScrapeOptions): GameImageSource[] {
   if (options.source) {
-    return [getSource(options.source)];
+    const source = getSource(options.source);
+    if (!source.implemented) {
+      throw new Error(
+        `Source "${source.name}" is registered but not implemented yet`,
+      );
+    }
+    return [source];
   }
   if (options.type) {
     const names = sourcesForType(options.type);
-    return names.map((n) => getSource(n)).filter((s) => {
-      try {
-        // Skip stubs that aren't implemented when type-based selection includes them
-        return s.name === "stake" || Boolean(getSourceConfig(s.name)?.enabled);
-      } catch {
-        return false;
-      }
-    });
+    const usable = names
+      .map((n) => {
+        try {
+          return getSource(n);
+        } catch {
+          return null;
+        }
+      })
+      .filter((s): s is GameImageSource => Boolean(s && s.implemented && s.enabled));
+    return usable;
   }
-  return listSources().filter((s) => s.name === "stake");
+  return listSources();
 }
 
-function selectGames(options: ScrapeOptions, targetType?: ImageType): GameRecord[] {
-  if (options.missingOnly && targetType) {
-    return listGames({ missingType: targetType, limit: options.limit });
-  }
-  if (options.missingOnly && options.source) {
-    const source = getSource(options.source);
-    const expected = source.expectedRatio;
-    if (expected && expected !== "unknown" && expected !== "other") {
-      return listGames({ missingType: expected, limit: options.limit });
-    }
+function selectGames(options: ScrapeOptions, desiredType?: ImageType): GameRecord[] {
+  if (options.missingOnly && desiredType) {
+    return listGames({ missingType: desiredType, limit: options.limit });
   }
   return listGames({ limit: options.limit });
 }
@@ -51,32 +66,33 @@ async function processGameWithSource(
   game: GameRecord,
   source: GameImageSource,
   options: ScrapeOptions,
-  targetType?: ImageType,
+  desiredType?: ImageType,
 ): Promise<"downloaded" | "skipped" | "review" | "failed" | "rejected"> {
+  const attemptType = desiredType ?? "any";
   bumpSourceStat(source.name, "attempted");
+  upsertSourceAttempt({
+    gameId: game.id,
+    source: source.name,
+    targetType: attemptType,
+    status: "processing",
+    incrementAttempt: true,
+  });
 
-  if (targetType && !options.overwrite) {
-    const existing = getImageByType(game.id, targetType);
+  if (desiredType && !options.overwrite) {
+    const existing = getImageByType(game.id, desiredType);
     if (existing) {
-      logger.info(`Skip ${game.name}: ${targetType} already exists`);
+      logger.info(`Skip ${game.name}: ${desiredType} already exists`);
+      upsertSourceAttempt({
+        gameId: game.id,
+        source: source.name,
+        targetType: attemptType,
+        status: "success",
+        lastError: null,
+      });
+      refreshGameCompletionStatus(game.id);
       return "skipped";
     }
   }
-
-  // If source has expected ratio and that type already exists, skip unless overwrite
-  const expected = source.expectedRatio;
-  if (
-    expected &&
-    expected !== "unknown" &&
-    expected !== "other" &&
-    !options.overwrite &&
-    getImageByType(game.id, expected)
-  ) {
-    logger.info(`Skip ${game.name}: ${expected} already exists for expected source ratio`);
-    return "skipped";
-  }
-
-  updateGameStatus(game.id, "processing");
 
   let searchResults: SearchResult[];
   try {
@@ -84,25 +100,39 @@ async function processGameWithSource(
   } catch (err) {
     const reason = `search_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: reason,
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason,
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
   if (!searchResults.length) {
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "not_found",
+      lastError: "no_search_results",
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason: "no_search_results",
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
@@ -115,25 +145,39 @@ async function processGameWithSource(
 
   if (decision === "reject") {
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: `match_rejected:${best.match.total}`,
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason: `match_rejected:${best.match.total}:${best.match.reasons.join("|")}`,
     });
+    refreshGameCompletionStatus(game.id);
     return "rejected";
   }
 
   if (decision === "review") {
     bumpSourceStat(source.name, "review");
-    updateGameStatus(game.id, "review");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "review",
+      lastError: `match_review:${best.match.total}:${best.result.title}`,
+    });
     logReviewNeeded({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason: `match_review:${best.match.total}:${best.result.title}:${best.match.reasons.join("|")}`,
     });
+    refreshGameCompletionStatus(game.id);
     return "review";
   }
 
@@ -141,6 +185,13 @@ async function processGameWithSource(
 
   if (options.dryRun) {
     logger.info(`[dry-run] Would extract images for ${game.name} <- ${best.result.title}`);
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "success",
+      lastError: null,
+    });
     refreshGameCompletionStatus(game.id);
     return "skipped";
   }
@@ -148,7 +199,6 @@ async function processGameWithSource(
   let page;
   try {
     page = await source.extractGame(best.result);
-    // Carry search thumbnail into extractImages via json
     page.json = {
       ...(typeof page.json === "object" && page.json ? page.json : {}),
       thumbnailUrl: best.result.thumbnailUrl,
@@ -157,13 +207,20 @@ async function processGameWithSource(
   } catch (err) {
     const reason = `extract_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: reason,
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason,
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
@@ -171,14 +228,22 @@ async function processGameWithSource(
   try {
     candidates = await source.extractImages(page);
   } catch (err) {
+    const reason = `image_extract_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: reason,
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
-      reason: `image_extract_failed: ${(err as Error).message}`,
+      reason,
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
@@ -187,31 +252,38 @@ async function processGameWithSource(
       url: best.result.thumbnailUrl,
       alt: best.result.title,
       sourceHint: "game-thumb",
+      context: "search.thumbnailUrl",
     });
   }
 
-  const ranked = candidates
-    .map((c) => {
-      const score = scoreImageCandidate(game, c);
-      return { candidate: c, score: score.total + best.match.total * 0.1, breakdown: score };
-    })
-    .sort((a, b) => b.score - a.score);
+  const ranked = rankImageCandidates(game, candidates).map((item) => ({
+    ...item,
+    score: item.score + best.match.total * 0.1,
+  }));
 
   if (!ranked.length) {
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: "no_image_candidates",
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason: "no_image_candidates",
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
   const proxy = getSourceConfig(source.name)?.proxy || undefined;
   let savedAny = false;
   let lastReason = "unknown";
+  let crossGameDup = false;
 
   for (const item of ranked.slice(0, 8)) {
     if (item.breakdown.total <= -50) continue;
@@ -220,18 +292,26 @@ async function processGameWithSource(
         game,
         url: item.candidate.url,
         source: source.name,
-        confidence: best.match.total,
+        gameMatchScore: best.match.total,
+        imageCandidateScore: item.breakdown.total,
         overwrite: options.overwrite,
         proxy,
-        preferType: targetType,
+        preferType: desiredType,
+        allowOther: options.type === "other",
       });
       if (saved.saved) {
         savedAny = true;
         bumpSourceStat(source.name, "downloaded");
-        // If we got the target type, stop; otherwise keep looking for better candidates of needed types
-        if (!targetType || saved.imageType === targetType) break;
-      } else {
-        lastReason = saved.reason ?? "not_saved";
+        break;
+      }
+      lastReason = saved.reason ?? "not_saved";
+      if (saved.reason === "cross_game_duplicate") {
+        crossGameDup = true;
+        break;
+      }
+      // wrong ratio / quality — keep trying other candidates
+      if (saved.reason?.startsWith("wrong_image_type:")) {
+        continue;
       }
     } catch (err) {
       lastReason = `download_failed: ${(err as Error).message}`;
@@ -239,18 +319,51 @@ async function processGameWithSource(
     }
   }
 
+  if (crossGameDup) {
+    bumpSourceStat(source.name, "review");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "review",
+      lastError: "cross_game_duplicate",
+    });
+    logReviewNeeded({
+      game: game.name,
+      provider: game.provider ?? "",
+      source: source.name,
+      reason: "cross_game_duplicate",
+    });
+    refreshGameCompletionStatus(game.id);
+    return "review";
+  }
+
   if (!savedAny) {
     bumpSourceStat(source.name, "failed");
-    updateGameStatus(game.id, "failed");
+    upsertSourceAttempt({
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "failed",
+      lastError: lastReason,
+    });
     logFailedGame({
       game: game.name,
       provider: game.provider ?? "",
       source: source.name,
       reason: lastReason,
     });
+    refreshGameCompletionStatus(game.id);
     return "failed";
   }
 
+  upsertSourceAttempt({
+    gameId: game.id,
+    source: source.name,
+    targetType: attemptType,
+    status: "success",
+    lastError: null,
+  });
   refreshGameCompletionStatus(game.id);
   return "downloaded";
 }
@@ -263,32 +376,32 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
 
   const sources = resolveSources(options);
   if (!sources.length) {
-    throw new Error("No sources selected");
+    throw new Error(
+      options.type
+        ? `No implemented sources available for type ${options.type}`
+        : "No sources selected",
+    );
   }
 
-  // Filter out unimplemented stubs when using --type
-  const usable = sources.filter((s) => s.name === "stake");
-  if (options.source && !usable.find((s) => s.name === options.source)) {
-    // Allow explicit source even if stub — it will throw clearly
-    usable.length = 0;
-    usable.push(getSource(options.source!));
-  } else if (!options.source && options.type) {
-    if (!usable.length) {
-      throw new Error(
-        `No implemented sources available for type ${options.type}. Currently implemented: stake`,
-      );
-    }
-  }
+  const gamesBase = selectGames(
+    options,
+    options.type ??
+      (sources[0] && resolveDesiredType(undefined, sources[0])),
+  );
 
-  const targetType = options.type;
-  const games = selectGames(options, targetType);
   logger.info(
-    `Scraping ${games.length} game(s) via ${usable.map((s) => s.name).join(", ")}${
-      targetType ? ` targeting ${targetType}` : ""
+    `Scraping ${gamesBase.length} game(s) via ${sources.map((s) => s.name).join(", ")}${
+      options.type ? ` targeting ${options.type}` : ""
     }`,
   );
 
-  for (const source of usable) {
+  for (const source of sources) {
+    const desiredType = resolveDesiredType(options.type, source);
+    const games =
+      options.missingOnly && desiredType && !options.type
+        ? listGames({ missingType: desiredType, limit: options.limit })
+        : gamesBase;
+
     const concurrency =
       options.concurrency ??
       source.concurrency ??
@@ -296,30 +409,95 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
       config.concurrency;
     const limit = createLimiter(concurrency);
 
-    await Promise.all(
-      games.map((game) =>
-        limit(async () => {
-          try {
-            await processGameWithSource(game, source, options, targetType);
-          } catch (err) {
-            logger.error(`Unhandled error for ${game.name}: ${(err as Error).message}`);
-            updateGameStatus(game.id, "failed");
-            logFailedGame({
-              game: game.name,
-              provider: game.provider ?? "",
-              source: source.name,
-              reason: `unhandled: ${(err as Error).message}`,
-            });
-          }
-        }),
-      ),
-    );
+    try {
+      if (source.init) await source.init();
+
+      await Promise.all(
+        games.map((game) =>
+          limit(async () => {
+            try {
+              await processGameWithSource(game, source, options, desiredType);
+            } catch (err) {
+              logger.error(`Unhandled error for ${game.name}: ${(err as Error).message}`);
+              upsertSourceAttempt({
+                gameId: game.id,
+                source: source.name,
+                targetType: desiredType ?? "any",
+                status: "failed",
+                lastError: `unhandled: ${(err as Error).message}`,
+                incrementAttempt: true,
+              });
+              logFailedGame({
+                game: game.name,
+                provider: game.provider ?? "",
+                source: source.name,
+                reason: `unhandled: ${(err as Error).message}`,
+              });
+              refreshGameCompletionStatus(game.id);
+            }
+          }),
+        ),
+      );
+    } finally {
+      if (source.close) await source.close();
+    }
   }
 }
 
 export async function retryFailed(options: ScrapeOptions = {}): Promise<void> {
-  const { resetFailedToPending } = await import("../database/db.js");
-  const n = resetFailedToPending();
-  logger.info(`Reset ${n} failed game(s) to pending`);
-  await runScrape(options);
+  const targetType = options.type;
+  const failed = listFailedSourceAttempts({
+    source: options.source,
+    targetType: targetType,
+    limit: options.limit,
+  });
+
+  if (!failed.length) {
+    logger.info("No failed source attempts to retry");
+    return;
+  }
+
+  const n = resetSourceAttemptsToPending({
+    source: options.source,
+    targetType: targetType ?? undefined,
+  });
+  logger.info(
+    `Retrying ${failed.length} failed attempt(s) (reset ${n})` +
+      `${options.source ? ` for ${options.source}` : ""}` +
+      `${targetType ? ` / ${targetType}` : ""}`,
+  );
+
+  const bySource = new Map<string, number[]>();
+  for (const attempt of failed) {
+    const list = bySource.get(attempt.source) ?? [];
+    list.push(attempt.gameId);
+    bySource.set(attempt.source, list);
+  }
+
+  for (const [sourceName, gameIds] of bySource) {
+    const source = getSource(sourceName);
+    if (!source.implemented) continue;
+
+    const desiredType = resolveDesiredType(options.type, source);
+    const games = listGames({ ids: [...new Set(gameIds)], limit: options.limit });
+    const concurrency =
+      options.concurrency ??
+      source.concurrency ??
+      getSourceConfig(source.name)?.concurrency ??
+      config.concurrency;
+    const limit = createLimiter(concurrency);
+
+    try {
+      if (source.init) await source.init();
+      await Promise.all(
+        games.map((game) =>
+          limit(async () => {
+            await processGameWithSource(game, source, options, desiredType);
+          }),
+        ),
+      );
+    } finally {
+      if (source.close) await source.close();
+    }
+  }
 }

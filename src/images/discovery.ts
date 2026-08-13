@@ -13,22 +13,63 @@ function absolutize(url: string, base: string): string | null {
 
 function pushCandidate(
   out: ImageCandidate[],
-  seen: Set<string>,
+  seen: Map<string, ImageCandidate>,
   partial: ImageCandidate,
   baseUrl: string,
 ): void {
   const abs = absolutize(partial.url, baseUrl);
-  if (!abs || seen.has(abs)) return;
-  if (!/^https?:/i.test(abs)) return;
-  seen.add(abs);
-  out.push({ ...partial, url: abs, filename: partial.filename ?? abs.split("/").pop() ?? null });
+  if (!abs || !/^https?:/i.test(abs)) return;
+
+  const next: ImageCandidate = {
+    ...partial,
+    url: abs,
+    filename: partial.filename ?? abs.split("/").pop()?.split("?")[0] ?? null,
+  };
+
+  const existing = seen.get(abs);
+  if (existing) {
+    // Keep richer hints / higher resolution descriptor
+    const existingHint = existing.widthHint ?? (existing.densityHint ? existing.densityHint * 100 : 0);
+    const nextHint = next.widthHint ?? (next.densityHint ? next.densityHint * 100 : 0);
+    if (nextHint > existingHint) {
+      seen.set(abs, { ...existing, ...next });
+      const idx = out.findIndex((c) => c.url === abs);
+      if (idx >= 0) out[idx] = seen.get(abs)!;
+    }
+    return;
+  }
+
+  seen.set(abs, next);
+  out.push(next);
 }
 
-function parseSrcset(srcset: string): string[] {
+export interface SrcsetEntry {
+  url: string;
+  widthHint?: number;
+  densityHint?: number;
+}
+
+/** Parse srcset retaining width (w) and density (x) descriptors. */
+export function parseSrcsetEntries(srcset: string): SrcsetEntry[] {
   return srcset
     .split(SRCSET_SPLIT)
-    .map((part) => part.trim().split(/\s+/)[0])
-    .filter(Boolean) as string[];
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const tokens = part.split(/\s+/);
+      const url = tokens[0] ?? "";
+      let widthHint: number | undefined;
+      let densityHint: number | undefined;
+      for (const token of tokens.slice(1)) {
+        if (/^\d+w$/i.test(token)) {
+          widthHint = Number.parseInt(token, 10);
+        } else if (/^\d+(\.\d+)?x$/i.test(token)) {
+          densityHint = Number.parseFloat(token);
+        }
+      }
+      return { url, widthHint, densityHint };
+    })
+    .filter((e) => Boolean(e.url));
 }
 
 function extractCssBackgroundUrls(style: string): string[] {
@@ -41,26 +82,53 @@ function extractCssBackgroundUrls(style: string): string[] {
   return urls;
 }
 
-function walkJsonForImages(value: unknown, out: string[], depth = 0): void {
+export interface JsonImageHit {
+  url: string;
+  key: string;
+  path: string;
+}
+
+function looksLikeImageUrl(value: string): boolean {
+  if (/^https?:\/\/.+\.(png|jpe?g|webp|gif|avif|heic|heif)(\?|$)/i.test(value)) return true;
+  if (/^https?:\/\/.*(imgix|cloudinary|cdn|image|thumb|media|mediumrare).+/i.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+function walkJsonForImages(
+  value: unknown,
+  out: JsonImageHit[],
+  pathParts: string[] = [],
+  depth = 0,
+): void {
   if (depth > 8 || out.length > 200) return;
+
   if (typeof value === "string") {
-    if (/^https?:\/\/.+\.(png|jpe?g|webp|gif|avif)(\?|$)/i.test(value)) {
-      out.push(value);
-    } else if (/^https?:\/\/.*(imgix|cloudinary|cdn|image|thumb|media).+/i.test(value)) {
-      out.push(value);
+    if (looksLikeImageUrl(value)) {
+      const key = pathParts[pathParts.length - 1] ?? "value";
+      out.push({ url: value, key, path: pathParts.join(".") || key });
     }
     return;
   }
+
   if (Array.isArray(value)) {
-    for (const item of value) walkJsonForImages(item, out, depth + 1);
+    value.forEach((item, index) => {
+      walkJsonForImages(item, out, [...pathParts, String(index)], depth + 1);
+    });
     return;
   }
+
   if (value && typeof value === "object") {
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (/image|thumb|poster|cover|icon|art/i.test(k) && typeof v === "string") {
-        out.push(v);
+      const nextPath = [...pathParts, k];
+      if (typeof v === "string" && (/image|thumb|poster|cover|icon|art|logo|banner/i.test(k) || looksLikeImageUrl(v))) {
+        if (looksLikeImageUrl(v)) {
+          out.push({ url: v, key: k, path: nextPath.join(".") });
+          continue;
+        }
       }
-      walkJsonForImages(v, out, depth + 1);
+      walkJsonForImages(v, out, nextPath, depth + 1);
     }
   }
 }
@@ -71,7 +139,7 @@ function walkJsonForImages(value: unknown, out: string[], depth = 0): void {
 export function discoverImagesFromHtml(html: string, pageUrl: string): ImageCandidate[] {
   const $ = cheerio.load(html);
   const out: ImageCandidate[] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, ImageCandidate>();
 
   $("img").each((_, el) => {
     const node = $(el);
@@ -103,15 +171,17 @@ export function discoverImagesFromHtml(html: string, pageUrl: string): ImageCand
     }
     const srcset = node.attr("srcset") || node.attr("data-srcset");
     if (srcset) {
-      for (const u of parseSrcset(srcset)) {
+      for (const entry of parseSrcsetEntries(srcset)) {
         pushCandidate(
           out,
           seen,
           {
-            url: u,
+            url: entry.url,
             alt: node.attr("alt") ?? null,
             cssClass: node.attr("class") ?? null,
             sourceHint: "img[srcset]",
+            widthHint: entry.widthHint,
+            densityHint: entry.densityHint,
           },
           pageUrl,
         );
@@ -123,8 +193,18 @@ export function discoverImagesFromHtml(html: string, pageUrl: string): ImageCand
     const node = $(el);
     const srcset = node.attr("srcset");
     if (!srcset) return;
-    for (const u of parseSrcset(srcset)) {
-      pushCandidate(out, seen, { url: u, sourceHint: "picture/source" }, pageUrl);
+    for (const entry of parseSrcsetEntries(srcset)) {
+      pushCandidate(
+        out,
+        seen,
+        {
+          url: entry.url,
+          sourceHint: "picture/source",
+          widthHint: entry.widthHint,
+          densityHint: entry.densityHint,
+        },
+        pageUrl,
+      );
     }
   });
 
@@ -160,25 +240,41 @@ export function discoverImagesFromHtml(html: string, pageUrl: string): ImageCand
     const text = $(el).html();
     if (!text) return;
     try {
-      const json = JSON.parse(text);
-      const urls: string[] = [];
-      walkJsonForImages(json, urls);
-      for (const u of urls) {
-        pushCandidate(out, seen, { url: u, sourceHint: "json-ld" }, pageUrl);
+      const hits: JsonImageHit[] = [];
+      walkJsonForImages(JSON.parse(text), hits);
+      for (const hit of hits) {
+        pushCandidate(
+          out,
+          seen,
+          {
+            url: hit.url,
+            sourceHint: `json-ld:${hit.key}`,
+            context: hit.path,
+          },
+          pageUrl,
+        );
       }
     } catch {
       /* ignore invalid json-ld */
     }
   });
 
-  // Next.js / Nuxt payloads
   const nextData = $("#__NEXT_DATA__").html();
   if (nextData) {
     try {
-      const urls: string[] = [];
-      walkJsonForImages(JSON.parse(nextData), urls);
-      for (const u of urls) {
-        pushCandidate(out, seen, { url: u, sourceHint: "__NEXT_DATA__" }, pageUrl);
+      const hits: JsonImageHit[] = [];
+      walkJsonForImages(JSON.parse(nextData), hits);
+      for (const hit of hits) {
+        pushCandidate(
+          out,
+          seen,
+          {
+            url: hit.url,
+            sourceHint: `__NEXT_DATA__:${hit.key}`,
+            context: hit.path,
+          },
+          pageUrl,
+        );
       }
     } catch {
       /* ignore */
@@ -200,12 +296,21 @@ export function discoverImagesFromHtml(html: string, pageUrl: string): ImageCand
 }
 
 export function discoverImagesFromJson(payload: unknown, baseUrl: string): ImageCandidate[] {
-  const urls: string[] = [];
-  walkJsonForImages(payload, urls);
+  const hits: JsonImageHit[] = [];
+  walkJsonForImages(payload, hits);
   const out: ImageCandidate[] = [];
-  const seen = new Set<string>();
-  for (const u of urls) {
-    pushCandidate(out, seen, { url: u, sourceHint: "json-payload" }, baseUrl);
+  const seen = new Map<string, ImageCandidate>();
+  for (const hit of hits) {
+    pushCandidate(
+      out,
+      seen,
+      {
+        url: hit.url,
+        sourceHint: `json:${hit.key}`,
+        context: hit.path,
+      },
+      baseUrl,
+    );
   }
   return out;
 }

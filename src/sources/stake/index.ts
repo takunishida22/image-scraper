@@ -1,3 +1,5 @@
+import type { Browser, BrowserContext, Page } from "playwright";
+import pLimit, { type LimitFunction } from "p-limit";
 import { config, getSourceConfig } from "../../config/index.js";
 import { discoverImagesFromHtml, discoverImagesFromJson } from "../../images/discovery.js";
 import type { GameImageSource } from "../SourceAdapter.js";
@@ -149,10 +151,13 @@ async function searchViaHttp(game: GameRecord): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   const seen = new Set<string>();
 
-  // Prefer slug lookup first for exact names
   const slug = slugifyGameName(game.name);
   try {
-    const data = await graphql<Record<string, unknown>>(SEARCH_QUERIES[2]!.query, { slug }, "SlugCasinoGame");
+    const data = await graphql<Record<string, unknown>>(
+      SEARCH_QUERIES[2]!.query,
+      { slug },
+      "SlugCasinoGame",
+    );
     for (const node of SEARCH_QUERIES[2]!.pick(data)) {
       const sr = toSearchResult(node, config.stake.baseUrl);
       if (sr && !seen.has(sr.url)) {
@@ -211,7 +216,10 @@ function ingestGraphqlData(
       continue;
     }
     const obj = cur as Record<string, unknown>;
-    if (typeof obj.name === "string" && (typeof obj.slug === "string" || obj.thumbnailUrl || obj.thumbUrl)) {
+    if (
+      typeof obj.name === "string" &&
+      (typeof obj.slug === "string" || obj.thumbnailUrl || obj.thumbUrl)
+    ) {
       const sr = toSearchResult(obj as StakeGameNode, config.stake.baseUrl);
       if (sr && !seen.has(sr.url)) {
         seen.add(sr.url);
@@ -222,52 +230,138 @@ function ingestGraphqlData(
   }
 }
 
-async function pageLooksBlocked(page: { title: () => Promise<string>; content: () => Promise<string> }): Promise<string | null> {
+async function pageLooksBlocked(page: Page): Promise<string | null> {
   const title = (await page.title()).toLowerCase();
   const html = (await page.content()).toLowerCase();
-  if (title.includes("just a moment") || html.includes("cf-mitigated") || html.includes("challenge-platform")) {
+  if (
+    title.includes("just a moment") ||
+    html.includes("cf-mitigated") ||
+    html.includes("challenge-platform")
+  ) {
     return "cloudflare_challenge";
   }
-  if (title.includes("maintenance") || html.includes("ip-blocked") || html.includes("stake under maintenance")) {
+  if (
+    title.includes("maintenance") ||
+    html.includes("ip-blocked") ||
+    html.includes("stake under maintenance")
+  ) {
     return "geo_or_ip_blocked";
   }
   return null;
 }
 
-async function searchViaPlaywright(game: GameRecord): Promise<{
-  results: SearchResult[];
-  payloads: unknown[];
-}> {
-  const { chromium } = await import("playwright");
-  const payloads: unknown[] = [];
+/** Shared Playwright browser for the Stake source lifecycle. */
+class StakeBrowserPool {
+  private browser: Browser | null = null;
+  private context: BrowserContext | null = null;
+  private pageLimit: LimitFunction | null = null;
+  private launching: Promise<void> | null = null;
+
+  async init(concurrency: number): Promise<void> {
+    this.pageLimit = pLimit(Math.max(1, concurrency));
+  }
+
+  private async ensureBrowser(): Promise<BrowserContext> {
+    if (this.context) return this.context;
+    if (!this.launching) {
+      this.launching = (async () => {
+        const { chromium } = await import("playwright");
+        this.browser = await chromium.launch({
+          headless: true,
+          proxy: config.stake.proxy ? { server: config.stake.proxy } : undefined,
+        });
+        this.context = await this.browser.newContext({
+          userAgent:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+          locale: "en-US",
+        });
+        if (config.stake.cfClearance) {
+          await this.context.addCookies([
+            {
+              name: "cf_clearance",
+              value: config.stake.cfClearance,
+              domain: new URL(config.stake.baseUrl).hostname,
+              path: "/",
+            },
+          ]);
+        }
+      })();
+    }
+    await this.launching;
+    this.launching = null;
+    if (!this.context) throw new Error("Stake browser failed to start");
+    return this.context;
+  }
+
+  async withPage<T>(fn: (page: Page) => Promise<T>): Promise<T> {
+    const limit = this.pageLimit ?? pLimit(1);
+    return limit(async () => {
+      const context = await this.ensureBrowser();
+      const page = await context.newPage();
+      try {
+        return await fn(page);
+      } finally {
+        await page.close().catch(() => undefined);
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    const browser = this.browser;
+    this.browser = null;
+    this.context = null;
+    this.pageLimit = null;
+    this.launching = null;
+    if (browser) {
+      await browser.close().catch(() => undefined);
+    }
+  }
+}
+
+const browserPool = new StakeBrowserPool();
+
+let httpAvailable: boolean | null = null;
+let playwrightNeeded: boolean | null = null;
+
+async function ensureTransport(): Promise<"http" | "playwright"> {
+  if (httpAvailable === true) return "http";
+  if (httpAvailable === false) return "playwright";
+
+  try {
+    await fetchText(`${config.stake.baseUrl}/casino/home`, {
+      proxy: config.stake.proxy || undefined,
+      retries: 0,
+      label: "stake-probe",
+    });
+    httpAvailable = true;
+    playwrightNeeded = false;
+    return "http";
+  } catch (err) {
+    if (!(err instanceof HttpError && (err.status === 403 || err.status === 503))) {
+      logger.debug(`Stake home probe failed: ${(err as Error).message}`);
+    }
+
+    try {
+      await graphql<Record<string, unknown>>("query Probe { __typename }", {}, "Probe");
+      httpAvailable = true;
+      playwrightNeeded = false;
+      return "http";
+    } catch {
+      httpAvailable = false;
+      playwrightNeeded = true;
+      logger.warn(
+        "Stake HTTP/GraphQL unavailable (Cloudflare or geo-block); Playwright fallback enabled. Set STAKE_CF_CLEARANCE / STAKE_ACCESS_TOKEN or STAKE_PROXY if needed.",
+      );
+      return "playwright";
+    }
+  }
+}
+
+async function searchViaPlaywright(game: GameRecord): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   const seen = new Set<string>();
 
-  const browser = await chromium.launch({
-    headless: true,
-    proxy: config.stake.proxy ? { server: config.stake.proxy } : undefined,
-  });
-
-  try {
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      locale: "en-US",
-    });
-
-    if (config.stake.cfClearance) {
-      await context.addCookies([
-        {
-          name: "cf_clearance",
-          value: config.stake.cfClearance,
-          domain: new URL(config.stake.baseUrl).hostname,
-          path: "/",
-        },
-      ]);
-    }
-
-    const page = await context.newPage();
-
+  return browserPool.withPage(async (page) => {
     page.on("response", async (response) => {
       try {
         const url = response.url();
@@ -275,11 +369,10 @@ async function searchViaPlaywright(game: GameRecord): Promise<{
         const ct = response.headers()["content-type"] ?? "";
         if (!ct.includes("json")) return;
         const json = await response.json();
-        payloads.push(json);
         const data = (json as { data?: Record<string, unknown> }).data;
         if (data) ingestGraphqlData(data, results, seen);
       } catch {
-        /* ignore non-json */
+        /* ignore */
       }
     });
 
@@ -287,7 +380,7 @@ async function searchViaPlaywright(game: GameRecord): Promise<{
       waitUntil: "domcontentloaded",
       timeout: config.requestTimeout,
     });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
 
     const blocked = await pageLooksBlocked(page);
     if (blocked) {
@@ -300,7 +393,6 @@ async function searchViaPlaywright(game: GameRecord): Promise<{
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (config.stake.accessToken) headers["x-access-token"] = config.stake.accessToken;
 
-    // Run GraphQL inside the browser so Cloudflare cookies apply
     for (const q of SEARCH_QUERIES) {
       const variables = q.name === "SlugCasinoGame" ? { slug } : { query: game.name };
       try {
@@ -322,26 +414,24 @@ async function searchViaPlaywright(game: GameRecord): Promise<{
             headers,
           },
         );
-        payloads.push(json);
         const data = (json as { data?: Record<string, unknown> }).data;
         if (data) ingestGraphqlData(data, results, seen);
         if (results.length) break;
       } catch {
-        /* try next query shape */
+        /* try next */
       }
     }
 
-    // Navigate game page as another signal source
     await page.goto(`${config.stake.baseUrl}/casino/games/${slug}`, {
       waitUntil: "domcontentloaded",
       timeout: config.requestTimeout,
     });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
 
     const search = page.locator('input[type="search"], input[placeholder*="Search" i]').first();
     if (await search.count()) {
       await search.fill(game.name);
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
     }
 
     const tiles = await page.evaluate(`(() => {
@@ -371,62 +461,62 @@ async function searchViaPlaywright(game: GameRecord): Promise<{
       });
     }
 
-    return { results, payloads };
-  } finally {
-    await browser.close();
-  }
+    return results;
+  });
 }
 
-let httpAvailable: boolean | null = null;
-let playwrightNeeded: boolean | null = null;
-
-async function ensureTransport(): Promise<"http" | "playwright"> {
-  if (httpAvailable === true) return "http";
-  if (httpAvailable === false) return "playwright";
-
-  try {
-    await fetchText(`${config.stake.baseUrl}/casino/home`, {
-      proxy: config.stake.proxy || undefined,
-      retries: 0,
-      label: "stake-probe",
+async function extractGameViaPlaywright(result: SearchResult): Promise<GamePageResult> {
+  return browserPool.withPage(async (page) => {
+    const payloads: unknown[] = [];
+    page.on("response", async (response) => {
+      try {
+        if (!response.url().includes("graphql")) return;
+        payloads.push(await response.json());
+      } catch {
+        /* ignore */
+      }
     });
-    httpAvailable = true;
-    playwrightNeeded = false;
-    return "http";
-  } catch (err) {
-    if (err instanceof HttpError && (err.status === 403 || err.status === 503)) {
-      // Still try GraphQL — sometimes HTML is challenged but API works with tokens
-    } else {
-      logger.debug(`Stake home probe failed: ${(err as Error).message}`);
+    await page.goto(result.url, {
+      waitUntil: "domcontentloaded",
+      timeout: config.requestTimeout,
+    });
+    await page.waitForTimeout(1500);
+    const blocked = await pageLooksBlocked(page);
+    if (blocked) {
+      throw new Error(`stake_blocked:${blocked}`);
     }
-
-    try {
-      await graphql<Record<string, unknown>>(
-        "query Probe { __typename }",
-        {},
-        "Probe",
-      );
-      httpAvailable = true;
-      playwrightNeeded = false;
-      return "http";
-    } catch {
-      httpAvailable = false;
-      playwrightNeeded = true;
-      logger.warn(
-        "Stake HTTP/GraphQL unavailable (Cloudflare or geo-block); Playwright fallback enabled. Set STAKE_CF_CLEARANCE / STAKE_ACCESS_TOKEN or STAKE_PROXY if needed.",
-      );
-      return "playwright";
-    }
-  }
+    const html = await page.content();
+    return {
+      title: result.title,
+      provider: result.provider,
+      slug: result.slug,
+      url: result.url,
+      html,
+      networkPayloads: payloads,
+    };
+  });
 }
+
+const stakeConcurrency =
+  getSourceConfig("stake")?.concurrency ?? config.stake.concurrency;
 
 export const stakeSource: GameImageSource = {
   name: "stake",
+  implemented: true,
+  enabled: getSourceConfig("stake")?.enabled ?? true,
   expectedRatio: getSourceConfig("stake")?.expectedRatio ?? "portrait",
   priority: getSourceConfig("stake")?.priority ?? 1,
-  concurrency: getSourceConfig("stake")?.concurrency ?? config.stake.concurrency,
+  concurrency: stakeConcurrency,
   httpWorks: undefined,
   playwrightRequired: undefined,
+
+  async init() {
+    await browserPool.init(stakeConcurrency);
+  },
+
+  async close() {
+    await browserPool.close();
+  },
 
   async probe() {
     const notes: string[] = [];
@@ -465,8 +555,7 @@ export const stakeSource: GameImageSource = {
       }
     }
 
-    const { results } = await searchViaPlaywright(game);
-    return results;
+    return searchViaPlaywright(game);
   },
 
   async extractGame(result: SearchResult): Promise<GamePageResult> {
@@ -490,59 +579,12 @@ export const stakeSource: GameImageSource = {
       }
     }
 
-    // Playwright page extract + network
-    const { chromium } = await import("playwright");
-    const browser = await chromium.launch({
-      headless: true,
-      proxy: config.stake.proxy ? { server: config.stake.proxy } : undefined,
-    });
-    try {
-      const context = await browser.newContext();
-      if (config.stake.cfClearance) {
-        await context.addCookies([
-          {
-            name: "cf_clearance",
-            value: config.stake.cfClearance,
-            domain: new URL(config.stake.baseUrl).hostname,
-            path: "/",
-          },
-        ]);
-      }
-      const page = await context.newPage();
-      const payloads: unknown[] = [];
-      page.on("response", async (response) => {
-        try {
-          if (!response.url().includes("graphql")) return;
-          payloads.push(await response.json());
-        } catch {
-          /* ignore */
-        }
-      });
-      await page.goto(result.url, { waitUntil: "domcontentloaded", timeout: config.requestTimeout });
-      await page.waitForTimeout(2000);
-      const html = await page.content();
-      return {
-        title: result.title,
-        provider: result.provider,
-        slug: result.slug,
-        url: result.url,
-        html,
-        networkPayloads: payloads,
-      };
-    } finally {
-      await browser.close();
-    }
+    return extractGameViaPlaywright(result);
   },
 
   async extractImages(gamePage: GamePageResult): Promise<ImageCandidate[]> {
     const candidates: ImageCandidate[] = [];
 
-    // Prefer thumbnail from search raw if present
-    const rawThumb =
-      (gamePage as GamePageResult & { thumbnailUrl?: string }).thumbnailUrl ||
-      null;
-
-    // Caller may pass search thumbnail via json
     if (gamePage.json && typeof gamePage.json === "object") {
       candidates.push(...discoverImagesFromJson(gamePage.json, gamePage.url));
     }
@@ -557,26 +599,15 @@ export const stakeSource: GameImageSource = {
       candidates.push(...discoverImagesFromHtml(gamePage.html, gamePage.url));
     }
 
-    if (rawThumb) {
-      candidates.unshift({
-        url: rawThumb,
-        alt: gamePage.title,
-        sourceHint: "game-thumb",
-      });
-    }
-
-    // Deduplicate
     const seen = new Set<string>();
     return candidates.filter((c) => {
       if (seen.has(c.url)) return false;
       seen.add(c.url);
-      // Prefer stake/mediumrare hosts
       return true;
     });
   },
 };
 
-// Expose transport flags after probe
 Object.defineProperty(stakeSource, "httpWorks", {
   get: () => httpAvailable ?? undefined,
 });

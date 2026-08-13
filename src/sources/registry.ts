@@ -10,20 +10,30 @@ const adapters: GameImageSource[] = [
   bitcasinoSource,
   slotcatalogSource,
   casinoguruSource,
-  // Future adapters (register when implemented):
-  // pragmaticplay, playngo, hacksaw, evolution, netent, spribe, redtiger, nolimit, pushgaming
 ];
 
+function isUsable(adapter: GameImageSource): boolean {
+  if (!adapter.implemented) return false;
+  if (!adapter.enabled) return false;
+  const cfg = getSourceConfig(adapter.name);
+  if (cfg && !cfg.enabled) return false;
+  return true;
+}
+
 export function listSources(): GameImageSource[] {
-  return adapters
-    .filter((a) => getSourceConfig(a.name)?.enabled !== false)
-    .sort((a, b) => a.priority - b.priority);
+  return adapters.filter(isUsable).sort((a, b) => a.priority - b.priority);
+}
+
+export function listAllRegisteredSources(): GameImageSource[] {
+  return [...adapters].sort((a, b) => a.priority - b.priority);
 }
 
 export function getSource(name: string): GameImageSource {
   const source = adapters.find((a) => a.name === name);
   if (!source) {
-    throw new Error(`Unknown source "${name}". Available: ${adapters.map((a) => a.name).join(", ")}`);
+    throw new Error(
+      `Unknown source "${name}". Available: ${adapters.map((a) => a.name).join(", ")}`,
+    );
   }
   const cfg = getSourceConfig(name);
   if (cfg && !cfg.enabled) {

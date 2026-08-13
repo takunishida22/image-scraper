@@ -4,7 +4,7 @@
   "description": "Production-ready casino game image scraper with pluggable source adapters",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "build": "tsc",
@@ -15,7 +15,9 @@
     "scrape": "tsx src/cli/index.ts scrape",
     "retry-failed": "tsx src/cli/index.ts retry-failed",
     "stats": "tsx src/cli/index.ts stats",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/tests/**/*.test.ts",
+    "smoke": "tsx src/scripts/smoke.ts"
   },
   "dependencies": {
     "cheerio": "^1.0.0",

@@ -84,13 +84,21 @@ program
 
 program
   .command("retry-failed")
-  .description("Reset failed games to pending and scrape again")
-  .option("--source <name>", "Source adapter name", "stake")
+  .description("Retry failed source attempts (optionally filtered by source/type)")
+  .option("--source <name>", "Source adapter name")
+  .option("--type <type>", "Target image type: portrait|square|landscape|other")
   .option("--limit <n>", "Limit number of games")
-  .action(async (opts: { source: string; limit?: string }) => {
+  .action(async (opts: { source?: string; type?: string; limit?: string }) => {
     getDb();
+    if (opts.type) {
+      const allowed = new Set(["portrait", "square", "landscape", "other"]);
+      if (!allowed.has(opts.type)) {
+        throw new Error(`Invalid --type ${opts.type}`);
+      }
+    }
     await retryFailed({
       source: opts.source,
+      type: opts.type as ImageType | undefined,
       limit: opts.limit ? Number.parseInt(opts.limit, 10) : undefined,
     });
     console.log(formatStats());
@@ -111,6 +119,8 @@ async function main() {
     logger.error((err as Error).message);
     process.exitCode = 1;
   } finally {
+    const { closeHttpAgents } = await import("../utils/http.js");
+    await closeHttpAgents();
     closeDb();
   }
 }

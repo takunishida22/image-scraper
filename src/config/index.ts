@@ -50,6 +50,7 @@ export interface AppConfig {
   logsDir: string;
   minImageWidth: number;
   minImageHeight: number;
+  maxImageBytes: number;
   matchAcceptThreshold: number;
   matchReviewThreshold: number;
   ratios: RatioThresholds;
@@ -77,6 +78,7 @@ export const config: AppConfig = {
   logsDir: path.resolve(root, envString("LOGS_DIR", "./logs")),
   minImageWidth: envInt("MIN_IMAGE_WIDTH", 250),
   minImageHeight: envInt("MIN_IMAGE_HEIGHT", 250),
+  maxImageBytes: envInt("MAX_IMAGE_BYTES", 26_214_400),
   matchAcceptThreshold: envInt("MATCH_ACCEPT_THRESHOLD", 100),
   matchReviewThreshold: envInt("MATCH_REVIEW_THRESHOLD", 70),
   ratios: {

@@ -8,6 +8,14 @@ export type GameStatus =
   | "failed"
   | "review";
 
+export type SourceAttemptStatus =
+  | "pending"
+  | "processing"
+  | "success"
+  | "failed"
+  | "review"
+  | "not_found";
+
 export type ExpectedRatio = ImageType | "unknown";
 
 export interface GameRecord {
@@ -31,8 +39,24 @@ export interface GameImageRecord {
   fileSize: number;
   source: string;
   sha256: string;
+  /** @deprecated use gameMatchScore */
   confidence: number;
+  gameMatchScore: number;
+  imageCandidateScore: number;
   createdAt: string;
+}
+
+export interface SourceAttemptRecord {
+  id: number;
+  gameId: number;
+  source: string;
+  targetType: string;
+  status: SourceAttemptStatus;
+  attemptCount: number;
+  lastError: string | null;
+  lastAttemptAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface SearchResult {
@@ -63,6 +87,8 @@ export interface ImageCandidate {
   cssClass?: string | null;
   sourceHint?: string | null;
   score?: number;
+  widthHint?: number;
+  densityHint?: number;
 }
 
 export interface MatchScoreBreakdown {

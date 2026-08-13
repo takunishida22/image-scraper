@@ -32,10 +32,10 @@ export function formatStats(): string {
     "Missing all:",
     fmt(s.missingAll),
     "",
-    "Review required:",
+    "Review required (source attempts):",
     fmt(s.review),
     "",
-    "Failed:",
+    "Failed (source attempts):",
     fmt(s.failed),
   ];
 

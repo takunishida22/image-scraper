@@ -30,6 +30,9 @@ const REJECT_PATTERNS = [
   /pixel\.(gif|png)/i,
 ];
 
+const LOGO_CONTEXT = /\b(logo|icon|favicon|providerLogo|provider_logo|casinoLogo)\b/i;
+const GOOD_CONTEXT = /\b(thumbnail|thumb|cover|coverImage|gameImage|game_image|artwork|poster|tile)\b/i;
+
 export function scoreSearchMatch(
   game: GameRecord,
   result: SearchResult,
@@ -108,12 +111,24 @@ export function scoreImageCandidate(
       } else if (/placeholder|spinner|loading|1x1|pixel/i.test(pattern.source)) {
         total -= 100;
         reasons.push("placeholder:-100");
+      } else if (/\bicon\b/i.test(pattern.source)) {
+        total -= 80;
+        reasons.push("icon:-80");
       } else {
         total -= 80;
         reasons.push("generic_casino_artwork:-80");
       }
       break;
     }
+  }
+
+  const contextBlob = `${candidate.context ?? ""} ${candidate.sourceHint ?? ""}`;
+  if (LOGO_CONTEXT.test(contextBlob)) {
+    total -= 90;
+    reasons.push("logo_context:-90");
+  } else if (GOOD_CONTEXT.test(contextBlob)) {
+    total += 25;
+    reasons.push("good_image_context:+25");
   }
 
   const wanted = normalizeGameName(game.name);
@@ -127,7 +142,11 @@ export function scoreImageCandidate(
     reasons.push("alt_exact_game_match:+20");
   }
 
-  if (wanted && filename && (filename === wanted || filename === slugifyGameName(game.name).replace(/-/g, " "))) {
+  if (
+    wanted &&
+    filename &&
+    (filename === wanted || filename === slugifyGameName(game.name).replace(/-/g, " "))
+  ) {
     total += 20;
     reasons.push("filename_exact_game_match:+20");
   }
@@ -140,6 +159,18 @@ export function scoreImageCandidate(
   if (candidate.sourceHint?.includes("game-thumb") || candidate.sourceHint?.includes("thumbnail")) {
     total += 25;
     reasons.push("thumbnail_context:+25");
+  }
+
+  // Prefer larger native srcset candidates (hints only — never invent URLs)
+  if (typeof candidate.widthHint === "number" && candidate.widthHint > 0) {
+    const bonus = Math.min(40, Math.floor(candidate.widthHint / 40));
+    total += bonus;
+    reasons.push(`srcset_width_hint:+${bonus}`);
+  }
+  if (typeof candidate.densityHint === "number" && candidate.densityHint > 0) {
+    const bonus = Math.min(30, Math.round(candidate.densityHint * 10));
+    total += bonus;
+    reasons.push(`srcset_density_hint:+${bonus}`);
   }
 
   return { total, reasons };
@@ -155,6 +186,27 @@ export function decideMatch(
   if (score >= accept) return "accept";
   if (score >= review) return "review";
   return "reject";
+}
+
+/** Rank candidates: score desc, then width/density hints desc. */
+export function rankImageCandidates(
+  game: GameRecord,
+  candidates: ImageCandidate[],
+): Array<{ candidate: ImageCandidate; score: number; breakdown: MatchScoreBreakdown }> {
+  return candidates
+    .map((candidate) => {
+      const breakdown = scoreImageCandidate(game, candidate);
+      return { candidate, score: breakdown.total, breakdown };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const aw = a.candidate.widthHint ?? 0;
+      const bw = b.candidate.widthHint ?? 0;
+      if (bw !== aw) return bw - aw;
+      const ad = a.candidate.densityHint ?? 0;
+      const bd = b.candidate.densityHint ?? 0;
+      return bd - ad;
+    });
 }
 
 function extractFilename(url: string): string {
