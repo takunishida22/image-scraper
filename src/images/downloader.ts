@@ -1,17 +1,23 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { config } from "../config/index.js";
 import { fetchBuffer } from "../utils/http.js";
 import { extensionFromFormat, inspectImage, sha256 } from "./inspector.js";
 import { validateImage } from "./validator.js";
-import { findImageByHash, getImageByType, upsertGameImage } from "../database/db.js";
+import {
+  findImageByHash,
+  getImageByType,
+  upsertGameImage,
+  type UpsertGameImageInput,
+  type UpsertGameImageResult,
+} from "../database/db.js";
 import { slugifyGameName } from "../core/normalizer.js";
 import type { GameRecord, ImageType } from "../types.js";
 import { logger } from "../utils/logger.js";
 
 export function gameImageDir(game: GameRecord): string {
   const slug = slugifyGameName(game.name) || `game`;
-  // Include DB id so same name + different provider never collide on disk
   return path.join(config.imagesDir, `${slug}__${game.id}`);
 }
 
@@ -25,242 +31,209 @@ export interface SaveImageResult {
   sha256?: string;
 }
 
-function cleanOrphanTmpFiles(dir: string): void {
-  if (!fs.existsSync(dir)) return;
+/** Delete only stale orphan temp files (never active writes from other processes). */
+export function cleanOrphanTmpFiles(
+  dir: string,
+  options: { nowMs?: number; maxAgeMs?: number } = {},
+): { removed: string[]; kept: string[] } {
+  const removed: string[] = [];
+  const kept: string[] = [];
+  if (!fs.existsSync(dir)) return { removed, kept };
+
+  const nowMs = options.nowMs ?? Date.now();
+  const maxAgeMs = options.maxAgeMs ?? config.tmpOrphanMaxAgeMs;
+
   for (const name of fs.readdirSync(dir)) {
-    if (name.endsWith(".tmp")) {
-      try {
-        fs.unlinkSync(path.join(dir, name));
-      } catch {
-        /* ignore */
+    // Our temps look like: .<basename>.tmp.<uuid>.tmp or .<basename>.bak.<uuid>.tmp
+    if (!name.startsWith(".") || !name.endsWith(".tmp")) continue;
+    const full = path.join(dir, name);
+    try {
+      const st = fs.statSync(full);
+      if (nowMs - st.mtimeMs >= maxAgeMs) {
+        fs.unlinkSync(full);
+        removed.push(full);
+      } else {
+        kept.push(full);
       }
+    } catch {
+      /* ignore */
     }
   }
+  return { removed, kept };
 }
 
-/** Write exact bytes atomically (temp file in same directory + rename). */
-export function atomicWriteFile(targetPath: string, buffer: Buffer): void {
+function tempPathBeside(targetPath: string, kind: "tmp" | "bak"): string {
   const dir = path.dirname(targetPath);
-  fs.mkdirSync(dir, { recursive: true });
-  cleanOrphanTmpFiles(dir);
+  const base = path.basename(targetPath);
+  return path.join(dir, `.${base}.${kind}.${crypto.randomUUID()}.tmp`);
+}
 
-  const tmp = path.join(
-    dir,
-    `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`,
-  );
-  const fd = fs.openSync(tmp, "w");
+function writeBytesToTemp(tmpPath: string, buffer: Buffer): void {
+  const fd = fs.openSync(tmpPath, "w");
   try {
     fs.writeSync(fd, buffer);
     try {
       fs.fsyncSync(fd);
     } catch {
-      /* fsync may be unsupported on some FS */
+      /* fsync may be unsupported */
     }
   } finally {
     fs.closeSync(fd);
   }
-  fs.renameSync(tmp, targetPath);
 }
 
-export async function downloadAndStoreImage(options: {
-  game: GameRecord;
-  url: string;
-  source: string;
-  gameMatchScore: number;
-  imageCandidateScore: number;
-  overwrite?: boolean;
-  proxy?: string;
-  /** Only save when classified type matches this exactly. */
-  preferType?: ImageType;
-  /** Allow saving "other" ratio (analyze / explicit --type other). */
-  allowOther?: boolean;
-}): Promise<SaveImageResult> {
-  const {
-    game,
-    url,
-    source,
-    gameMatchScore,
-    imageCandidateScore,
-    overwrite = false,
-    proxy,
-    preferType,
-    allowOther = false,
-  } = options;
+export interface ReplacementPlan {
+  localPath: string;
+  relativePath: string;
+  backupPath: string | null;
+  isSamePathReplacement: boolean;
+  isFirstWrite: boolean;
+}
 
-  const downloaded = await fetchBuffer(url, { proxy, label: `image:${source}` });
-  const hash = sha256(downloaded.buffer);
-
-  let inspection;
-  try {
-    inspection = await inspectImage(downloaded.buffer);
-  } catch (err) {
-    return { saved: false, reason: (err as Error).message, sha256: hash };
-  }
-
-  const validation = validateImage(inspection, downloaded.contentType);
-  if (!validation.ok) {
-    return {
-      saved: false,
-      reason: validation.reason,
-      imageType: inspection.imageType,
-      width: inspection.width,
-      height: inspection.height,
-      sha256: hash,
-    };
-  }
-
-  const imageType = inspection.imageType;
-
-  if (preferType && imageType !== preferType) {
-    return {
-      saved: false,
-      reason: `wrong_image_type:${imageType}`,
-      imageType,
-      width: inspection.width,
-      height: inspection.height,
-      sha256: hash,
-    };
-  }
-
-  if (imageType === "other" && preferType !== "other" && !allowOther) {
-    return {
-      saved: false,
-      reason: "wrong_image_type:other",
-      imageType,
-      width: inspection.width,
-      height: inspection.height,
-      sha256: hash,
-    };
-  }
-
-  const existingSameHash = findImageByHash(hash);
-  if (existingSameHash) {
-    if (existingSameHash.gameId === game.id && existingSameHash.imageType === imageType) {
-      return {
-        saved: false,
-        reason: "already_stored",
-        localPath: existingSameHash.localPath,
-        imageType,
-        width: inspection.width,
-        height: inspection.height,
-        sha256: hash,
-      };
-    }
-    if (existingSameHash.gameId !== game.id) {
-      return {
-        saved: false,
-        reason: "cross_game_duplicate",
-        localPath: existingSameHash.localPath,
-        imageType,
-        width: inspection.width,
-        height: inspection.height,
-        sha256: hash,
-      };
-    }
-  }
-
-  const existing = getImageByType(game.id, imageType);
-  if (existing && !overwrite) {
-    const existingPixels = existing.width * existing.height;
-    const newPixels = inspection.width * inspection.height;
-    if (newPixels <= existingPixels) {
-      return {
-        saved: false,
-        reason: "existing_better_or_equal",
-        localPath: existing.localPath,
-        imageType,
-        width: existing.width,
-        height: existing.height,
-        sha256: existing.sha256,
-      };
-    }
-  }
-
-  const dir = gameImageDir(game);
+/**
+ * Stage native bytes on disk safely.
+ * Same-path replacements: write temp → move old to backup → move temp into place.
+ * First writes: atomic temp → target.
+ * Different-path upgrades: write new path; keep old until DB confirms.
+ */
+export function stageNativeImageFile(
+  localPath: string,
+  buffer: Buffer,
+  previousAbsolutePath: string | null,
+): ReplacementPlan {
+  const dir = path.dirname(localPath);
   fs.mkdirSync(dir, { recursive: true });
+  cleanOrphanTmpFiles(dir);
 
-  const ext = extensionFromFormat(inspection.format, downloaded.contentType, downloaded.finalUrl);
-  const filename = `${imageType}.${ext}`;
-  const localPath = path.join(dir, filename);
   const relativePath = path.relative(process.cwd(), localPath).replace(/\\/g, "/");
-  const previousPath = existing?.localPath
-    ? path.isAbsolute(existing.localPath)
-      ? existing.localPath
-      : path.resolve(process.cwd(), existing.localPath)
-    : null;
+  const previousExists =
+    Boolean(previousAbsolutePath) && fs.existsSync(previousAbsolutePath as string);
+  const samePath =
+    previousExists &&
+    path.resolve(previousAbsolutePath as string) === path.resolve(localPath);
 
-  // Preserve original network bytes — no Sharp transform / recompress
-  atomicWriteFile(localPath, downloaded.buffer);
+  if (!previousExists) {
+    const tmp = tempPathBeside(localPath, "tmp");
+    writeBytesToTemp(tmp, buffer);
+    fs.renameSync(tmp, localPath);
+    return {
+      localPath,
+      relativePath,
+      backupPath: null,
+      isSamePathReplacement: false,
+      isFirstWrite: true,
+    };
+  }
 
-  const result = upsertGameImage({
-    gameId: game.id,
-    imageType,
-    localPath: relativePath,
-    width: inspection.width,
-    height: inspection.height,
-    format: ext,
-    fileSize: downloaded.buffer.length,
-    source,
-    sha256: hash,
-    gameMatchScore,
-    imageCandidateScore,
-    overwrite,
-  });
-
-  if (!result.saved) {
-    // DB rejected — remove newly written file if it isn't the previous one
-    if (!previousPath || path.resolve(previousPath) !== path.resolve(localPath)) {
+  if (samePath) {
+    const tmp = tempPathBeside(localPath, "tmp");
+    const backup = tempPathBeside(localPath, "bak");
+    writeBytesToTemp(tmp, buffer);
+    // Keep old bytes as backup until DB update succeeds
+    fs.renameSync(localPath, backup);
+    try {
+      fs.renameSync(tmp, localPath);
+    } catch (err) {
+      // Restore old file if promoting new file fails
       try {
-        fs.unlinkSync(localPath);
+        if (fs.existsSync(backup)) fs.renameSync(backup, localPath);
+      } catch {
+        /* ignore */
+      }
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
+    return {
+      localPath,
+      relativePath,
+      backupPath: backup,
+      isSamePathReplacement: true,
+      isFirstWrite: false,
+    };
+  }
+
+  // Format/path change: write new file; retain previous as backup to delete after DB success
+  const tmp = tempPathBeside(localPath, "tmp");
+  writeBytesToTemp(tmp, buffer);
+  fs.renameSync(tmp, localPath);
+  return {
+    localPath,
+    relativePath,
+    backupPath: previousAbsolutePath,
+    isSamePathReplacement: false,
+    isFirstWrite: false,
+  };
+}
+
+export function finalizeNativeImageFile(
+  plan: ReplacementPlan,
+  dbOk: boolean,
+): void {
+  if (dbOk) {
+    if (plan.backupPath && fs.existsSync(plan.backupPath)) {
+      // Same-path: backup is temp .bak; different-path: backup is previous image
+      try {
+        fs.unlinkSync(plan.backupPath);
       } catch {
         /* ignore */
       }
     }
-    return { saved: false, reason: result.reason, imageType, sha256: hash };
+    return;
   }
 
-  // After successful DB update, remove obsolete file if extension/path changed
-  if (
-    previousPath &&
-    path.resolve(previousPath) !== path.resolve(localPath) &&
-    fs.existsSync(previousPath)
-  ) {
+  // DB failed — restore previous state
+  if (plan.isSamePathReplacement && plan.backupPath && fs.existsSync(plan.backupPath)) {
     try {
-      fs.unlinkSync(previousPath);
+      if (fs.existsSync(plan.localPath)) fs.unlinkSync(plan.localPath);
     } catch {
       /* ignore */
     }
+    try {
+      fs.renameSync(plan.backupPath, plan.localPath);
+    } catch {
+      /* ignore */
+    }
+    return;
   }
 
-  logger.info(
-    `Saved ${game.name} [${imageType}] ${inspection.width}x${inspection.height} from ${source}`,
-  );
-
-  return {
-    saved: true,
-    localPath: result.record?.localPath,
-    imageType,
-    width: inspection.width,
-    height: inspection.height,
-    sha256: hash,
-  };
+  // First write or different-path new file: remove the new file; keep previous untouched
+  if (fs.existsSync(plan.localPath)) {
+    // Only delete if this was a new path (not restoring into previous)
+    if (plan.isFirstWrite || !plan.isSamePathReplacement) {
+      // For different-path, localPath is the NEW file — delete it
+      // For first write, delete the new file
+      if (
+        plan.isFirstWrite ||
+        (plan.backupPath && path.resolve(plan.backupPath) !== path.resolve(plan.localPath))
+      ) {
+        try {
+          fs.unlinkSync(plan.localPath);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
 }
 
-/**
- * Store already-downloaded native bytes (for tests / offline fixtures).
- * Still enforces preferType and never transforms bytes.
- */
-export async function storeImageBuffer(options: {
+type UpsertFn = (input: UpsertGameImageInput) => UpsertGameImageResult;
+
+async function persistValidatedBuffer(options: {
   game: GameRecord;
   buffer: Buffer;
+  contentType: string | null;
+  sourceUrl: string;
   source: string;
   gameMatchScore: number;
   imageCandidateScore: number;
-  contentType?: string | null;
-  fakeUrl?: string;
   overwrite?: boolean;
   preferType?: ImageType;
   allowOther?: boolean;
+  upsertFn?: UpsertFn;
 }): Promise<SaveImageResult> {
   const hash = sha256(options.buffer);
   let inspection;
@@ -270,9 +243,16 @@ export async function storeImageBuffer(options: {
     return { saved: false, reason: (err as Error).message, sha256: hash };
   }
 
-  const validation = validateImage(inspection, options.contentType ?? null);
+  const validation = validateImage(inspection, options.contentType);
   if (!validation.ok) {
-    return { saved: false, reason: validation.reason, imageType: inspection.imageType, sha256: hash };
+    return {
+      saved: false,
+      reason: validation.reason,
+      imageType: inspection.imageType,
+      width: inspection.width,
+      height: inspection.height,
+      sha256: hash,
+    };
   }
 
   const imageType = inspection.imageType;
@@ -298,33 +278,36 @@ export async function storeImageBuffer(options: {
   }
 
   const existingSameHash = findImageByHash(hash);
-  if (existingSameHash && existingSameHash.gameId !== options.game.id) {
-    return {
-      saved: false,
-      reason: "cross_game_duplicate",
-      imageType,
-      width: inspection.width,
-      height: inspection.height,
-      sha256: hash,
-    };
-  }
-  if (
-    existingSameHash &&
-    existingSameHash.gameId === options.game.id &&
-    existingSameHash.imageType === imageType
-  ) {
-    return {
-      saved: false,
-      reason: "already_stored",
-      localPath: existingSameHash.localPath,
-      imageType,
-      sha256: hash,
-    };
+  if (existingSameHash) {
+    if (existingSameHash.gameId === options.game.id && existingSameHash.imageType === imageType) {
+      return {
+        saved: false,
+        reason: "already_stored",
+        localPath: existingSameHash.localPath,
+        imageType,
+        width: inspection.width,
+        height: inspection.height,
+        sha256: hash,
+      };
+    }
+    if (existingSameHash.gameId !== options.game.id) {
+      return {
+        saved: false,
+        reason: "cross_game_duplicate",
+        localPath: existingSameHash.localPath,
+        imageType,
+        width: inspection.width,
+        height: inspection.height,
+        sha256: hash,
+      };
+    }
   }
 
   const existing = getImageByType(options.game.id, imageType);
   if (existing && !options.overwrite) {
-    if (existing.width * existing.height >= inspection.width * inspection.height) {
+    const existingPixels = existing.width * existing.height;
+    const newPixels = inspection.width * inspection.height;
+    if (newPixels <= existingPixels) {
       return {
         saved: false,
         reason: "existing_better_or_equal",
@@ -337,59 +320,53 @@ export async function storeImageBuffer(options: {
     }
   }
 
-  const dir = gameImageDir(options.game);
-  const ext = extensionFromFormat(
-    inspection.format,
-    options.contentType ?? null,
-    options.fakeUrl ?? `file.${inspection.format}`,
-  );
-  const localPath = path.join(dir, `${imageType}.${ext}`);
-  const relativePath = path.relative(process.cwd(), localPath).replace(/\\/g, "/");
+  const ext = extensionFromFormat(inspection.format, options.contentType, options.sourceUrl);
+  const localPath = path.join(gameImageDir(options.game), `${imageType}.${ext}`);
   const previousPath = existing?.localPath
     ? path.isAbsolute(existing.localPath)
       ? existing.localPath
       : path.resolve(process.cwd(), existing.localPath)
     : null;
 
-  atomicWriteFile(localPath, options.buffer);
+  const plan = stageNativeImageFile(localPath, options.buffer, previousPath);
+  const upsert = options.upsertFn ?? upsertGameImage;
 
-  const result = upsertGameImage({
-    gameId: options.game.id,
-    imageType,
-    localPath: relativePath,
-    width: inspection.width,
-    height: inspection.height,
-    format: ext,
-    fileSize: options.buffer.length,
-    source: options.source,
-    sha256: hash,
-    gameMatchScore: options.gameMatchScore,
-    imageCandidateScore: options.imageCandidateScore,
-    overwrite: options.overwrite,
-  });
+  let result: UpsertGameImageResult;
+  try {
+    result = upsert({
+      gameId: options.game.id,
+      imageType,
+      localPath: plan.relativePath,
+      width: inspection.width,
+      height: inspection.height,
+      format: ext,
+      fileSize: options.buffer.length,
+      source: options.source,
+      sha256: hash,
+      gameMatchScore: options.gameMatchScore,
+      imageCandidateScore: options.imageCandidateScore,
+      overwrite: options.overwrite,
+    });
+  } catch (err) {
+    finalizeNativeImageFile(plan, false);
+    return {
+      saved: false,
+      reason: `db_update_failed: ${(err as Error).message}`,
+      imageType,
+      sha256: hash,
+    };
+  }
 
   if (!result.saved) {
-    if (!previousPath || path.resolve(previousPath) !== path.resolve(localPath)) {
-      try {
-        fs.unlinkSync(localPath);
-      } catch {
-        /* ignore */
-      }
-    }
+    finalizeNativeImageFile(plan, false);
     return { saved: false, reason: result.reason, imageType, sha256: hash };
   }
 
-  if (
-    previousPath &&
-    path.resolve(previousPath) !== path.resolve(localPath) &&
-    fs.existsSync(previousPath)
-  ) {
-    try {
-      fs.unlinkSync(previousPath);
-    } catch {
-      /* ignore */
-    }
-  }
+  finalizeNativeImageFile(plan, true);
+
+  logger.info(
+    `Saved ${options.game.name} [${imageType}] ${inspection.width}x${inspection.height} from ${options.source}`,
+  );
 
   return {
     saved: true,
@@ -399,6 +376,65 @@ export async function storeImageBuffer(options: {
     height: inspection.height,
     sha256: hash,
   };
+}
+
+export async function downloadAndStoreImage(options: {
+  game: GameRecord;
+  url: string;
+  source: string;
+  gameMatchScore: number;
+  imageCandidateScore: number;
+  overwrite?: boolean;
+  proxy?: string;
+  preferType?: ImageType;
+  allowOther?: boolean;
+  upsertFn?: UpsertFn;
+}): Promise<SaveImageResult> {
+  const downloaded = await fetchBuffer(options.url, {
+    proxy: options.proxy,
+    label: `image:${options.source}`,
+  });
+  return persistValidatedBuffer({
+    game: options.game,
+    buffer: downloaded.buffer,
+    contentType: downloaded.contentType,
+    sourceUrl: downloaded.finalUrl,
+    source: options.source,
+    gameMatchScore: options.gameMatchScore,
+    imageCandidateScore: options.imageCandidateScore,
+    overwrite: options.overwrite,
+    preferType: options.preferType,
+    allowOther: options.allowOther,
+    upsertFn: options.upsertFn,
+  });
+}
+
+export async function storeImageBuffer(options: {
+  game: GameRecord;
+  buffer: Buffer;
+  source: string;
+  gameMatchScore: number;
+  imageCandidateScore: number;
+  contentType?: string | null;
+  fakeUrl?: string;
+  overwrite?: boolean;
+  preferType?: ImageType;
+  allowOther?: boolean;
+  upsertFn?: UpsertFn;
+}): Promise<SaveImageResult> {
+  return persistValidatedBuffer({
+    game: options.game,
+    buffer: options.buffer,
+    contentType: options.contentType ?? null,
+    sourceUrl: options.fakeUrl ?? `file.${options.contentType ?? "bin"}`,
+    source: options.source,
+    gameMatchScore: options.gameMatchScore,
+    imageCandidateScore: options.imageCandidateScore,
+    overwrite: options.overwrite,
+    preferType: options.preferType,
+    allowOther: options.allowOther,
+    upsertFn: options.upsertFn,
+  });
 }
 
 export async function inspectRemoteImage(

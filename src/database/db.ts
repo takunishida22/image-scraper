@@ -204,22 +204,7 @@ export function findImageByHash(sha256: string): GameImageRecord | null {
   return row ? mapImage(row) : null;
 }
 
-export function upsertGameImage(input: {
-  gameId: number;
-  imageType: ImageType;
-  localPath: string;
-  width: number;
-  height: number;
-  format: string;
-  fileSize: number;
-  source: string;
-  sha256: string;
-  gameMatchScore: number;
-  imageCandidateScore: number;
-  /** @deprecated */
-  confidence?: number;
-  overwrite?: boolean;
-}): { saved: boolean; reason?: string; record?: GameImageRecord } {
+export function upsertGameImage(input: UpsertGameImageInput): UpsertGameImageResult {
   const database = getDb();
   const existing = getImageByType(input.gameId, input.imageType);
   const gameMatchScore = input.gameMatchScore ?? input.confidence ?? 0;
@@ -282,6 +267,29 @@ export function upsertGameImage(input: {
   const record = getImageByType(input.gameId, input.imageType);
   return { saved: true, record: record ?? undefined };
 }
+
+export type UpsertGameImageInput = {
+  gameId: number;
+  imageType: ImageType;
+  localPath: string;
+  width: number;
+  height: number;
+  format: string;
+  fileSize: number;
+  source: string;
+  sha256: string;
+  gameMatchScore: number;
+  imageCandidateScore: number;
+  /** @deprecated */
+  confidence?: number;
+  overwrite?: boolean;
+};
+
+export type UpsertGameImageResult = {
+  saved: boolean;
+  reason?: string;
+  record?: GameImageRecord;
+};
 
 /**
  * Derive game status from collected images only (not from a single source failure).
@@ -404,6 +412,29 @@ export function resetSourceAttemptsToPending(options: {
     )
     .run(...params);
   return Number(result.changes ?? 0);
+}
+
+/** Reset only the exact attempt rows selected for a retry batch. */
+export function resetSourceAttemptsByIds(ids: number[]): number {
+  if (!ids.length) return 0;
+  const database = getDb();
+  const placeholders = ids.map(() => "?").join(",");
+  const result = database
+    .prepare(
+      `UPDATE source_attempts
+       SET status = 'pending', updated_at = datetime('now')
+       WHERE id IN (${placeholders})
+         AND status IN ('failed', 'not_found', 'review')`,
+    )
+    .run(...ids);
+  return Number(result.changes ?? 0);
+}
+
+export function countSourceAttemptsByStatus(status: SourceAttemptStatus): number {
+  const row = getDb()
+    .prepare(`SELECT COUNT(*) AS c FROM source_attempts WHERE status = ?`)
+    .get(status) as { c: number };
+  return Number(row.c);
 }
 
 export function bumpSourceStat(

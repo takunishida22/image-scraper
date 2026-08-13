@@ -51,6 +51,7 @@ export interface AppConfig {
   minImageWidth: number;
   minImageHeight: number;
   maxImageBytes: number;
+  tmpOrphanMaxAgeMs: number;
   matchAcceptThreshold: number;
   matchReviewThreshold: number;
   ratios: RatioThresholds;
@@ -79,6 +80,7 @@ export const config: AppConfig = {
   minImageWidth: envInt("MIN_IMAGE_WIDTH", 250),
   minImageHeight: envInt("MIN_IMAGE_HEIGHT", 250),
   maxImageBytes: envInt("MAX_IMAGE_BYTES", 26_214_400),
+  tmpOrphanMaxAgeMs: envInt("TMP_ORPHAN_MAX_AGE_MS", 3_600_000),
   matchAcceptThreshold: envInt("MATCH_ACCEPT_THRESHOLD", 100),
   matchReviewThreshold: envInt("MATCH_REVIEW_THRESHOLD", 70),
   ratios: {

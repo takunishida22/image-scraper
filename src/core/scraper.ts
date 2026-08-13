@@ -6,7 +6,7 @@ import {
   listGames,
   recoverStaleProcessing,
   refreshGameCompletionStatus,
-  resetSourceAttemptsToPending,
+  resetSourceAttemptsByIds,
   upsertSourceAttempt,
 } from "../database/db.js";
 import { downloadAndStoreImage } from "../images/downloader.js";
@@ -14,7 +14,13 @@ import { decideMatch, rankImageCandidates, scoreSearchMatch } from "./matcher.js
 import { createLimiter } from "./queue.js";
 import { getSource, listSources } from "../sources/registry.js";
 import type { GameImageSource } from "../sources/SourceAdapter.js";
-import type { GameRecord, ImageType, ScrapeOptions, SearchResult } from "../types.js";
+import type {
+  GameRecord,
+  ImageType,
+  ScrapeOptions,
+  SearchResult,
+  SourceAttemptStatus,
+} from "../types.js";
 import { logFailedGame, logReviewNeeded, logger } from "../utils/logger.js";
 
 function resolveDesiredType(
@@ -62,6 +68,21 @@ function selectGames(options: ScrapeOptions, desiredType?: ImageType): GameRecor
   return listGames({ limit: options.limit });
 }
 
+function recordAttempt(
+  dryRun: boolean | undefined,
+  input: {
+    gameId: number;
+    source: string;
+    targetType: string;
+    status: SourceAttemptStatus;
+    lastError?: string | null;
+    incrementAttempt?: boolean;
+  },
+): void {
+  if (dryRun) return;
+  upsertSourceAttempt(input);
+}
+
 async function processGameWithSource(
   game: GameRecord,
   source: GameImageSource,
@@ -70,7 +91,7 @@ async function processGameWithSource(
 ): Promise<"downloaded" | "skipped" | "review" | "failed" | "rejected"> {
   const attemptType = desiredType ?? "any";
   bumpSourceStat(source.name, "attempted");
-  upsertSourceAttempt({
+  recordAttempt(options.dryRun, {
     gameId: game.id,
     source: source.name,
     targetType: attemptType,
@@ -82,7 +103,7 @@ async function processGameWithSource(
     const existing = getImageByType(game.id, desiredType);
     if (existing) {
       logger.info(`Skip ${game.name}: ${desiredType} already exists`);
-      upsertSourceAttempt({
+      recordAttempt(options.dryRun, {
         gameId: game.id,
         source: source.name,
         targetType: attemptType,
@@ -100,7 +121,7 @@ async function processGameWithSource(
   } catch (err) {
     const reason = `search_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -119,7 +140,7 @@ async function processGameWithSource(
 
   if (!searchResults.length) {
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -145,7 +166,7 @@ async function processGameWithSource(
 
   if (decision === "reject") {
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -164,7 +185,7 @@ async function processGameWithSource(
 
   if (decision === "review") {
     bumpSourceStat(source.name, "review");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -185,13 +206,7 @@ async function processGameWithSource(
 
   if (options.dryRun) {
     logger.info(`[dry-run] Would extract images for ${game.name} <- ${best.result.title}`);
-    upsertSourceAttempt({
-      gameId: game.id,
-      source: source.name,
-      targetType: attemptType,
-      status: "success",
-      lastError: null,
-    });
+    // Do not persist success (or any) source_attempt rows for dry-run
     refreshGameCompletionStatus(game.id);
     return "skipped";
   }
@@ -207,7 +222,7 @@ async function processGameWithSource(
   } catch (err) {
     const reason = `extract_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -230,7 +245,7 @@ async function processGameWithSource(
   } catch (err) {
     const reason = `image_extract_failed: ${(err as Error).message}`;
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -263,7 +278,7 @@ async function processGameWithSource(
 
   if (!ranked.length) {
     bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -283,7 +298,7 @@ async function processGameWithSource(
   const proxy = getSourceConfig(source.name)?.proxy || undefined;
   let savedAny = false;
   let lastReason = "unknown";
-  let crossGameDup = false;
+  let sawCrossGameDup = false;
 
   for (const item of ranked.slice(0, 8)) {
     if (item.breakdown.total <= -50) continue;
@@ -306,10 +321,10 @@ async function processGameWithSource(
       }
       lastReason = saved.reason ?? "not_saved";
       if (saved.reason === "cross_game_duplicate") {
-        crossGameDup = true;
-        break;
+        // Keep searching for a unique candidate; review only if none succeed
+        sawCrossGameDup = true;
+        continue;
       }
-      // wrong ratio / quality — keep trying other candidates
       if (saved.reason?.startsWith("wrong_image_type:")) {
         continue;
       }
@@ -319,9 +334,21 @@ async function processGameWithSource(
     }
   }
 
-  if (crossGameDup) {
+  if (savedAny) {
+    recordAttempt(options.dryRun, {
+      gameId: game.id,
+      source: source.name,
+      targetType: attemptType,
+      status: "success",
+      lastError: null,
+    });
+    refreshGameCompletionStatus(game.id);
+    return "downloaded";
+  }
+
+  if (sawCrossGameDup) {
     bumpSourceStat(source.name, "review");
-    upsertSourceAttempt({
+    recordAttempt(options.dryRun, {
       gameId: game.id,
       source: source.name,
       targetType: attemptType,
@@ -338,34 +365,22 @@ async function processGameWithSource(
     return "review";
   }
 
-  if (!savedAny) {
-    bumpSourceStat(source.name, "failed");
-    upsertSourceAttempt({
-      gameId: game.id,
-      source: source.name,
-      targetType: attemptType,
-      status: "failed",
-      lastError: lastReason,
-    });
-    logFailedGame({
-      game: game.name,
-      provider: game.provider ?? "",
-      source: source.name,
-      reason: lastReason,
-    });
-    refreshGameCompletionStatus(game.id);
-    return "failed";
-  }
-
-  upsertSourceAttempt({
+  bumpSourceStat(source.name, "failed");
+  recordAttempt(options.dryRun, {
     gameId: game.id,
     source: source.name,
     targetType: attemptType,
-    status: "success",
-    lastError: null,
+    status: "failed",
+    lastError: lastReason,
+  });
+  logFailedGame({
+    game: game.name,
+    provider: game.provider ?? "",
+    source: source.name,
+    reason: lastReason,
   });
   refreshGameCompletionStatus(game.id);
-  return "downloaded";
+  return "failed";
 }
 
 export async function runScrape(options: ScrapeOptions): Promise<void> {
@@ -392,7 +407,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
   logger.info(
     `Scraping ${gamesBase.length} game(s) via ${sources.map((s) => s.name).join(", ")}${
       options.type ? ` targeting ${options.type}` : ""
-    }`,
+    }${options.dryRun ? " [dry-run]" : ""}`,
   );
 
   for (const source of sources) {
@@ -419,7 +434,7 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
               await processGameWithSource(game, source, options, desiredType);
             } catch (err) {
               logger.error(`Unhandled error for ${game.name}: ${(err as Error).message}`);
-              upsertSourceAttempt({
+              recordAttempt(options.dryRun, {
                 gameId: game.id,
                 source: source.name,
                 targetType: desiredType ?? "any",
@@ -457,12 +472,10 @@ export async function retryFailed(options: ScrapeOptions = {}): Promise<void> {
     return;
   }
 
-  const n = resetSourceAttemptsToPending({
-    source: options.source,
-    targetType: targetType ?? undefined,
-  });
+  const selectedIds = failed.map((a) => a.id);
+  const n = resetSourceAttemptsByIds(selectedIds);
   logger.info(
-    `Retrying ${failed.length} failed attempt(s) (reset ${n})` +
+    `Retrying ${failed.length} failed attempt(s) (reset ${n} by id)` +
       `${options.source ? ` for ${options.source}` : ""}` +
       `${targetType ? ` / ${targetType}` : ""}`,
   );
