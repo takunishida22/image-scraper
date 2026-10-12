@@ -3,7 +3,14 @@ dist/
 .env
 data/*.db
 data/*.db-*
+data/bcgame-catalog.json
+data/betgaliano-catalog.json
+data/regencycasino-catalog.json
+data/databetrix-catalog.json
+data/grosvenorcasino-catalog.json
+data/multiwin-catalog.json
 /images/
+/images-verify/
 /logs/
 *.log
 .DS_Store

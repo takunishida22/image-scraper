@@ -11,7 +11,7 @@ import type {
   SourceAttemptStatus,
   SourceStats,
 } from "../types.js";
-import { normalizeGameName } from "../core/normalizer.js";
+import { canonicalizeGameName, normalizeGameName } from "../core/normalizer.js";
 import { runMigrations } from "./migrations.js";
 
 let db: DatabaseSync | null = null;
@@ -33,6 +33,16 @@ function mapGame(row: Record<string, unknown>): GameRecord {
     normalizedName: String(row.normalized_name),
     provider: row.provider == null ? null : String(row.provider),
     status: String(row.status) as GameStatus,
+    externalId: row.external_id == null || row.external_id === "" ? null : String(row.external_id),
+    imgUrl: row.img_url == null || row.img_url === "" ? null : String(row.img_url),
+    imgVerticalUrl:
+      row.img_vertical_url == null || row.img_vertical_url === ""
+        ? null
+        : String(row.img_vertical_url),
+    imgWideUrl:
+      row.img_wide_url == null || row.img_wide_url === "" ? null : String(row.img_wide_url),
+    imgSquareUrl:
+      row.img_square_url == null || row.img_square_url === "" ? null : String(row.img_square_url),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -75,19 +85,47 @@ function mapAttempt(row: Record<string, unknown>): SourceAttemptRecord {
 }
 
 export function importGames(
-  rows: Array<{ name: string; provider?: string | null }>,
-): { inserted: number; skipped: number } {
+  rows: Array<{
+    name: string;
+    provider?: string | null;
+    externalId?: string | null;
+    imgUrl?: string | null;
+    imgVerticalUrl?: string | null;
+    imgWideUrl?: string | null;
+    imgSquareUrl?: string | null;
+  }>,
+): { inserted: number; skipped: number; updated: number } {
   const database = getDb();
-  const select = database.prepare(
+  const selectByExternal = database.prepare(
+    "SELECT id FROM games WHERE external_id = ? AND external_id IS NOT NULL AND external_id != ''",
+  );
+  const selectByName = database.prepare(
     "SELECT id FROM games WHERE normalized_name = ? AND IFNULL(provider, '') = IFNULL(?, '')",
   );
   const insert = database.prepare(
-    `INSERT INTO games (name, normalized_name, provider, status, created_at, updated_at)
-     VALUES (?, ?, ?, 'pending', datetime('now'), datetime('now'))`,
+    `INSERT INTO games (
+       name, normalized_name, provider, status, external_id,
+       img_url, img_vertical_url, img_wide_url, img_square_url,
+       created_at, updated_at
+     ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+  );
+  const updateUrls = database.prepare(
+    `UPDATE games SET
+       name = ?,
+       normalized_name = ?,
+       provider = ?,
+       external_id = COALESCE(?, external_id),
+       img_url = COALESCE(?, img_url),
+       img_vertical_url = COALESCE(?, img_vertical_url),
+       img_wide_url = COALESCE(?, img_wide_url),
+       img_square_url = COALESCE(?, img_square_url),
+       updated_at = datetime('now')
+     WHERE id = ?`,
   );
 
   let inserted = 0;
   let skipped = 0;
+  let updated = 0;
 
   database.exec("BEGIN");
   try {
@@ -99,12 +137,46 @@ export function importGames(
       }
       const provider = row.provider?.trim() || null;
       const normalized = normalizeGameName(name);
-      const existing = select.get(normalized, provider) as { id: number } | undefined;
-      if (existing) {
-        skipped++;
+      const externalId = row.externalId?.trim() || null;
+      const imgUrl = normalizeSeedUrl(row.imgUrl);
+      const imgVerticalUrl = normalizeSeedUrl(row.imgVerticalUrl);
+      const imgWideUrl = normalizeSeedUrl(row.imgWideUrl);
+      const imgSquareUrl = normalizeSeedUrl(row.imgSquareUrl);
+
+      let existingId: number | undefined;
+      if (externalId) {
+        existingId = (selectByExternal.get(externalId) as { id: number } | undefined)?.id;
+      }
+      if (existingId == null) {
+        existingId = (selectByName.get(normalized, provider) as { id: number } | undefined)?.id;
+      }
+
+      if (existingId != null) {
+        updateUrls.run(
+          name,
+          normalized,
+          provider,
+          externalId,
+          imgUrl,
+          imgVerticalUrl,
+          imgWideUrl,
+          imgSquareUrl,
+          existingId,
+        );
+        updated++;
         continue;
       }
-      insert.run(name, normalized, provider);
+
+      insert.run(
+        name,
+        normalized,
+        provider,
+        externalId,
+        imgUrl,
+        imgVerticalUrl,
+        imgWideUrl,
+        imgSquareUrl,
+      );
       inserted++;
     }
     database.exec("COMMIT");
@@ -112,13 +184,46 @@ export function importGames(
     database.exec("ROLLBACK");
     throw err;
   }
-  return { inserted, skipped };
+  return { inserted, skipped, updated };
+}
+
+function normalizeSeedUrl(value?: string | null): string | null {
+  if (!value) return null;
+  const v = value.trim();
+  if (!v || /^null$/i.test(v)) return null;
+  if (!/^https?:\/\//i.test(v)) return null;
+  if (/favicon\.ico/i.test(v)) return null;
+  return v;
+}
+
+export function listGamesWithSeedUrls(options: { limit?: number } = {}): GameRecord[] {
+  const database = getDb();
+  const limit = options.limit ? `LIMIT ${Number(options.limit)}` : "";
+  const rows = database
+    .prepare(
+      `SELECT * FROM games
+       WHERE (img_url IS NOT NULL AND img_url != '')
+          OR (img_vertical_url IS NOT NULL AND img_vertical_url != '')
+          OR (img_wide_url IS NOT NULL AND img_wide_url != '')
+          OR (img_square_url IS NOT NULL AND img_square_url != '')
+       ORDER BY id ASC ${limit}`,
+    )
+    .all() as Record<string, unknown>[];
+  return rows.map(mapGame);
+}
+
+export function collectSeedUrls(game: GameRecord): string[] {
+  const urls = [game.imgUrl, game.imgVerticalUrl, game.imgWideUrl, game.imgSquareUrl].filter(
+    (u): u is string => Boolean(u),
+  );
+  return [...new Set(urls)];
 }
 
 export function listGames(options: {
   status?: GameStatus | GameStatus[];
   limit?: number;
   missingType?: ImageType;
+  missingAnyType?: boolean;
   ids?: number[];
 } = {}): GameRecord[] {
   const database = getDb();
@@ -141,6 +246,16 @@ export function listGames(options: {
     params.push(options.missingType);
   }
 
+  if (options.missingAnyType) {
+    clauses.push(
+      `NOT (
+         EXISTS (SELECT 1 FROM game_images gi WHERE gi.game_id = games.id AND gi.image_type = 'portrait')
+         AND EXISTS (SELECT 1 FROM game_images gi WHERE gi.game_id = games.id AND gi.image_type = 'square')
+         AND EXISTS (SELECT 1 FROM game_images gi WHERE gi.game_id = games.id AND gi.image_type = 'landscape')
+       )`,
+    );
+  }
+
   if (options.ids?.length) {
     clauses.push(`id IN (${options.ids.map(() => "?").join(",")})`);
     params.push(...options.ids);
@@ -150,6 +265,16 @@ export function listGames(options: {
   const limit = options.limit ? `LIMIT ${Number(options.limit)}` : "";
   const stmt = database.prepare(`SELECT * FROM games ${where} ORDER BY id ASC ${limit}`);
   const rows = (params.length ? stmt.all(...params) : stmt.all()) as Record<string, unknown>[];
+  return rows.map(mapGame);
+}
+
+/** All games whose normalized name equals the given name (case/format insensitive). */
+export function listGamesByNormalizedName(name: string): GameRecord[] {
+  const key = canonicalizeGameName(name);
+  if (!key) return [];
+  const rows = getDb()
+    .prepare(`SELECT * FROM games WHERE lower(normalized_name) = ? ORDER BY id ASC`)
+    .all(key) as Record<string, unknown>[];
   return rows.map(mapGame);
 }
 

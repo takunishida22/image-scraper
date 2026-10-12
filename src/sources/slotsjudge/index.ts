@@ -92,6 +92,23 @@ function isGameArtworkUrl(url: string, slug: string): boolean {
   return u.includes(`/slots/${slug}/`) || u.includes(`/${slug}-`);
 }
 
+/** Prefer tile logos; drop gameplay screenshots / paytables / casino promo banners. */
+function isSlotsjudgeGameLogo(url: string): boolean {
+  const u = url.toLowerCase();
+  if (!/slot[-_]?logo/.test(u)) return false;
+  if (/gameplay|paytable|bonus|mobile|ante-bet|free-spins|tumble|multiplier|casino/.test(u)) {
+    return false;
+  }
+  return true;
+}
+
+function cacheWidthHint(url: string): number | undefined {
+  const m = url.match(/-(\d+)x\d+(?:sw|sh|s|ch|cw|w|h)?\.(?:jpe?g|png|webp|gif)/i);
+  if (!m?.[1]) return undefined;
+  const n = Number.parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 async function fetchPage(url: string): Promise<string | null> {
   try {
     const html = await fetchText(url, { retries: 1, label: "slotsjudge-page" });
@@ -156,26 +173,52 @@ async function extractImages(gamePage: GamePageResult): Promise<ImageCandidate[]
   if (!gamePage.html) return [];
   const slug = gamePage.slug || slugifyGameName(gamePage.title);
   const discovered = discoverImagesFromHtml(gamePage.html, gamePage.url);
-  const out: ImageCandidate[] = [];
+  const logos: ImageCandidate[] = [];
   const seen = new Set<string>();
 
   for (const candidate of discovered) {
     if (!isGameArtworkUrl(candidate.url, slug)) continue;
-    const originals = [unwrapSlotsjudgeImageUrl(candidate.url), candidate.url].filter(
-      (u, i, arr) => arr.indexOf(u) === i,
-    );
-    for (const url of originals) {
-      if (seen.has(url)) continue;
-      seen.add(url);
-      out.push({
-        ...candidate,
-        url,
-        filename: url.split("/").pop()?.split("?")[0] ?? candidate.filename,
-        sourceHint: url.includes("/image/data/") ? "slotsjudge-original" : candidate.sourceHint,
-      });
-    }
+    if (!isSlotsjudgeGameLogo(candidate.url)) continue;
+    if (seen.has(candidate.url)) continue;
+    seen.add(candidate.url);
+    logos.push({
+      ...candidate,
+      filename: candidate.url.split("/").pop()?.split("?")[0] ?? candidate.filename,
+      widthHint: candidate.widthHint ?? cacheWidthHint(candidate.url),
+      sourceHint: "slot-logo",
+      context: "slotsjudge.game-tile",
+    });
   }
 
+  if (!logos.length) return [];
+
+  const caches = logos
+    .filter((c) => typeof c.widthHint === "number" && c.widthHint > 0)
+    .sort((a, b) => (b.widthHint ?? 0) - (a.widthHint ?? 0));
+  const bestCache = caches[0];
+  const originalUrl = bestCache
+    ? unwrapSlotsjudgeImageUrl(bestCache.url)
+    : unwrapSlotsjudgeImageUrl(logos[0]!.url);
+
+  const out: ImageCandidate[] = [];
+  const push = (url: string, widthHint?: number) => {
+    if (seen.has(`out:${url}`)) return;
+    seen.add(`out:${url}`);
+    out.push({
+      url,
+      alt: bestCache?.alt ?? logos[0]?.alt ?? null,
+      filename: url.split("/").pop()?.split("?")[0] ?? null,
+      widthHint,
+      sourceHint: "slot-logo",
+      context: "slotsjudge.game-tile",
+    });
+  };
+
+  // Original first (often larger than cache), then largest known cache as fallback
+  push(originalUrl, bestCache?.widthHint);
+  if (bestCache && bestCache.url !== originalUrl) {
+    push(bestCache.url, bestCache.widthHint);
+  }
   return out;
 }
 

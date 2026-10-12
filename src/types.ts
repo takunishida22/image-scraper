@@ -24,6 +24,11 @@ export interface GameRecord {
   normalizedName: string;
   provider: string | null;
   status: GameStatus;
+  externalId: string | null;
+  imgUrl: string | null;
+  imgVerticalUrl: string | null;
+  imgWideUrl: string | null;
+  imgSquareUrl: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +94,8 @@ export interface ImageCandidate {
   score?: number;
   widthHint?: number;
   densityHint?: number;
+  /** Optional transparent artwork composited over the primary image. */
+  overlayUrl?: string | null;
 }
 
 export interface MatchScoreBreakdown {
@@ -104,6 +111,24 @@ export interface ScrapeOptions {
   limit?: number;
   concurrency?: number;
   dryRun?: boolean;
+}
+
+export interface SeedImageOptions {
+  limit?: number;
+  concurrency?: number;
+  overwrite?: boolean;
+  missingOnly?: boolean;
+  dryRun?: boolean;
+}
+
+export interface ImportGameRow {
+  name: string;
+  provider?: string | null;
+  externalId?: string | null;
+  imgUrl?: string | null;
+  imgVerticalUrl?: string | null;
+  imgWideUrl?: string | null;
+  imgSquareUrl?: string | null;
 }
 
 export interface AnalyzeSourceOptions {

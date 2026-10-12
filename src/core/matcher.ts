@@ -2,7 +2,6 @@ import { config } from "../config/index.js";
 import {
   hasMeaningfulVariantDiff,
   normalizeGameName,
-  providerNormalize,
   slugifyGameName,
 } from "./normalizer.js";
 import type { GameRecord, ImageCandidate, MatchScoreBreakdown, SearchResult } from "../types.js";
@@ -30,8 +29,12 @@ const REJECT_PATTERNS = [
   /pixel\.(gif|png)/i,
 ];
 
+/** Game tile / cover art — keep these even though filenames often contain "logo". */
+const GAME_TILE_ART =
+  /\bslot[-_]?logo\b|\bgame[-_]?logo\b|\bgame[-_]?tile\b|\bcover[-_]?art\b|\bkey[-_]?art\b|\bgame[-_]?thumb\b/i;
+
 const LOGO_CONTEXT = /\b(logo|icon|favicon|providerLogo|provider_logo|casinoLogo)\b/i;
-const GOOD_CONTEXT = /\b(thumbnail|thumb|cover|coverImage|gameImage|game_image|artwork|poster|tile)\b/i;
+const GOOD_CONTEXT = /\b(thumbnail|thumb|cover|coverImage|gameImage|game_image|artwork|poster|tile|slot-logo|game-thumb)\b/i;
 
 export function scoreSearchMatch(
   game: GameRecord,
@@ -40,6 +43,8 @@ export function scoreSearchMatch(
   const reasons: string[] = [];
   let total = 0;
 
+  // result.title is source display name (BC.Game: fullName — not gameIdentity.gameName)
+  // Provider is ignored: same normalized name → accept.
   const wanted = normalizeGameName(game.name);
   const found = normalizeGameName(result.title);
   const wantedSlug = slugifyGameName(game.name);
@@ -48,7 +53,7 @@ export function scoreSearchMatch(
   if (wanted && found && wanted === found) {
     total += 100;
     reasons.push("exact_normalized_title:+100");
-  } else if (wanted && found && (found.startsWith(wanted + " ") || wanted.startsWith(found + " "))) {
+  } else if (wanted && found && (found.startsWith(wanted + "-") || wanted.startsWith(found + "-"))) {
     total += 20;
     reasons.push("strong_partial_title:+20");
   } else if (wanted && found && (found.includes(wanted) || wanted.includes(found))) {
@@ -59,18 +64,6 @@ export function scoreSearchMatch(
   if (hasMeaningfulVariantDiff(game.name, result.title)) {
     total -= 70;
     reasons.push("different_version_suffix:-70");
-  }
-
-  const wantedProvider = providerNormalize(game.provider);
-  const foundProvider = providerNormalize(result.provider);
-  if (wantedProvider && foundProvider) {
-    if (wantedProvider === foundProvider) {
-      total += 30;
-      reasons.push("exact_provider_match:+30");
-    } else {
-      total -= 50;
-      reasons.push("different_provider:-50");
-    }
   }
 
   if (wantedSlug && foundSlug && wantedSlug === foundSlug) {
@@ -100,30 +93,36 @@ export function scoreImageCandidate(
     .filter(Boolean)
     .join(" ");
 
-  for (const pattern of REJECT_PATTERNS) {
-    if (pattern.test(blob)) {
-      if (/logo/i.test(pattern.source)) {
-        total -= 100;
-        reasons.push("logo:-100");
-      } else if (/banner|hero/i.test(pattern.source)) {
-        total -= 60;
-        reasons.push("banner:-60");
-      } else if (/placeholder|spinner|loading|1x1|pixel/i.test(pattern.source)) {
-        total -= 100;
-        reasons.push("placeholder:-100");
-      } else if (/\bicon\b/i.test(pattern.source)) {
-        total -= 80;
-        reasons.push("icon:-80");
-      } else {
-        total -= 80;
-        reasons.push("generic_casino_artwork:-80");
+  const isGameTile = GAME_TILE_ART.test(blob);
+  if (isGameTile) {
+    total += 60;
+    reasons.push("game_tile_art:+60");
+  } else {
+    for (const pattern of REJECT_PATTERNS) {
+      if (pattern.test(blob)) {
+        if (/logo/i.test(pattern.source)) {
+          total -= 100;
+          reasons.push("logo:-100");
+        } else if (/banner|hero/i.test(pattern.source)) {
+          total -= 60;
+          reasons.push("banner:-60");
+        } else if (/placeholder|spinner|loading|1x1|pixel/i.test(pattern.source)) {
+          total -= 100;
+          reasons.push("placeholder:-100");
+        } else if (/\bicon\b/i.test(pattern.source)) {
+          total -= 80;
+          reasons.push("icon:-80");
+        } else {
+          total -= 80;
+          reasons.push("generic_casino_artwork:-80");
+        }
+        break;
       }
-      break;
     }
   }
 
   const contextBlob = `${candidate.context ?? ""} ${candidate.sourceHint ?? ""}`;
-  if (LOGO_CONTEXT.test(contextBlob)) {
+  if (!isGameTile && LOGO_CONTEXT.test(contextBlob)) {
     total -= 90;
     reasons.push("logo_context:-90");
   } else if (GOOD_CONTEXT.test(contextBlob)) {
@@ -145,7 +144,7 @@ export function scoreImageCandidate(
   if (
     wanted &&
     filename &&
-    (filename === wanted || filename === slugifyGameName(game.name).replace(/-/g, " "))
+    (filename === wanted || filename === slugifyGameName(game.name))
   ) {
     total += 20;
     reasons.push("filename_exact_game_match:+20");

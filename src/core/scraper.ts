@@ -262,7 +262,10 @@ async function processGameWithSource(
     return "failed";
   }
 
-  if (best.result.thumbnailUrl) {
+  if (
+    best.result.thumbnailUrl &&
+    !candidates.some((candidate) => candidate.url === best.result.thumbnailUrl)
+  ) {
     candidates.unshift({
       url: best.result.thumbnailUrl,
       alt: best.result.title,
@@ -310,14 +313,23 @@ async function processGameWithSource(
         gameMatchScore: best.match.total,
         imageCandidateScore: item.breakdown.total,
         overwrite: options.overwrite,
+        missingOnly: options.missingOnly,
         proxy,
         preferType: desiredType,
         allowOther: options.type === "other",
+        minWidth: source.minImageWidth,
+        minHeight: source.minImageHeight,
+        squareMinRatio: source.squareMinRatio,
+        squareMaxRatio: source.squareMaxRatio,
+        landscapeMaxRatio: source.landscapeMaxRatio,
+        allowSameNameDuplicate: source.allowSameNameDuplicateImages,
+        overlayUrl: item.candidate.overlayUrl,
       });
       if (saved.saved) {
         savedAny = true;
         bumpSourceStat(source.name, "downloaded");
-        break;
+        if (!source.saveAllCandidates) break;
+        continue;
       }
       lastReason = saved.reason ?? "not_saved";
       if (saved.reason === "cross_game_duplicate") {
@@ -398,24 +410,40 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     );
   }
 
-  const gamesBase = selectGames(
-    options,
-    options.type ??
-      (sources[0] && resolveDesiredType(undefined, sources[0])),
-  );
+  const gamesBase = selectGames(options, options.type);
 
-  logger.info(
-    `Scraping ${gamesBase.length} game(s) via ${sources.map((s) => s.name).join(", ")}${
-      options.type ? ` targeting ${options.type}` : ""
-    }${options.dryRun ? " [dry-run]" : ""}`,
-  );
+  if (!options.missingOnly) {
+    logger.info(
+      `Scraping ${gamesBase.length} game(s) via ${sources.map((s) => s.name).join(", ")}${
+        options.type ? ` targeting ${options.type}` : ""
+      }${options.dryRun ? " [dry-run]" : ""}`,
+    );
+  } else {
+    const supported =
+      sources.length === 1 ? sources[0]?.supportedTypes : undefined;
+    const detectsOnce =
+      sources.length === 1 ? sources[0]?.detectTypeOnce : false;
+    logger.info(
+      `Scraping missing image types via ${sources.map((s) => s.name).join(", ")}` +
+        `${
+          options.type
+            ? ` (${options.type} only)`
+            : detectsOnce
+              ? " (detect type once)"
+              : ` (${(supported ?? ["portrait", "square", "landscape"]).join(", ")})`
+        }` +
+        `${options.dryRun ? " [dry-run]" : ""}`,
+    );
+  }
 
   for (const source of sources) {
-    const desiredType = resolveDesiredType(options.type, source);
-    const games =
-      options.missingOnly && desiredType && !options.type
-        ? listGames({ missingType: desiredType, limit: options.limit })
-        : gamesBase;
+    const typesToRun: Array<ImageType | undefined> = options.type
+      ? [options.type]
+      : options.missingOnly
+        ? source.detectTypeOnce
+          ? [undefined]
+          : (source.supportedTypes ?? ["portrait", "square", "landscape"])
+        : [resolveDesiredType(undefined, source)];
 
     const concurrency =
       options.concurrency ??
@@ -427,32 +455,54 @@ export async function runScrape(options: ScrapeOptions): Promise<void> {
     try {
       if (source.init) await source.init();
 
-      await Promise.all(
-        games.map((game) =>
-          limit(async () => {
-            try {
-              await processGameWithSource(game, source, options, desiredType);
-            } catch (err) {
-              logger.error(`Unhandled error for ${game.name}: ${(err as Error).message}`);
-              recordAttempt(options.dryRun, {
-                gameId: game.id,
-                source: source.name,
-                targetType: desiredType ?? "any",
-                status: "failed",
-                lastError: `unhandled: ${(err as Error).message}`,
-                incrementAttempt: true,
-              });
-              logFailedGame({
-                game: game.name,
-                provider: game.provider ?? "",
-                source: source.name,
-                reason: `unhandled: ${(err as Error).message}`,
-              });
-              refreshGameCompletionStatus(game.id);
-            }
-          }),
-        ),
-      );
+      for (const desiredType of typesToRun) {
+        const games =
+          options.missingOnly && desiredType
+            ? listGames({ missingType: desiredType, limit: options.limit })
+            : options.missingOnly && source.detectTypeOnce
+              ? listGames({ missingAnyType: true, limit: options.limit })
+            : gamesBase;
+
+        if (!games.length) {
+          if (desiredType) {
+            logger.info(`No games missing ${desiredType} for ${source.name}`);
+          }
+          continue;
+        }
+
+        logger.info(
+          `Scraping ${games.length} game(s) via ${source.name}` +
+            `${desiredType ? ` targeting ${desiredType}` : ""}` +
+            `${options.dryRun ? " [dry-run]" : ""}`,
+        );
+
+        await Promise.all(
+          games.map((game) =>
+            limit(async () => {
+              try {
+                await processGameWithSource(game, source, options, desiredType);
+              } catch (err) {
+                logger.error(`Unhandled error for ${game.name}: ${(err as Error).message}`);
+                recordAttempt(options.dryRun, {
+                  gameId: game.id,
+                  source: source.name,
+                  targetType: desiredType ?? "any",
+                  status: "failed",
+                  lastError: `unhandled: ${(err as Error).message}`,
+                  incrementAttempt: true,
+                });
+                logFailedGame({
+                  game: game.name,
+                  provider: game.provider ?? "",
+                  source: source.name,
+                  reason: `unhandled: ${(err as Error).message}`,
+                });
+                refreshGameCompletionStatus(game.id);
+              }
+            }),
+          ),
+        );
+      }
     } finally {
       if (source.close) await source.close();
     }

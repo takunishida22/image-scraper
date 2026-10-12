@@ -1,24 +1,49 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import sharp from "sharp";
 import { config } from "../config/index.js";
 import { fetchBuffer } from "../utils/http.js";
-import { extensionFromFormat, inspectImage, sha256 } from "./inspector.js";
+import { inspectImage, sha256 } from "./inspector.js";
 import { validateImage } from "./validator.js";
 import {
   findImageByHash,
+  getGameById,
   getImageByType,
   upsertGameImage,
   type UpsertGameImageInput,
   type UpsertGameImageResult,
 } from "../database/db.js";
-import { slugifyGameName } from "../core/normalizer.js";
+import { gameFolderSlug, normalizeGameName } from "../core/normalizer.js";
 import type { GameRecord, ImageType } from "../types.js";
 import { logger } from "../utils/logger.js";
 
 export function gameImageDir(game: GameRecord): string {
-  const slug = slugifyGameName(game.name) || `game`;
-  return path.join(config.imagesDir, `${slug}__${game.id}`);
+  return path.join(config.imagesDir, gameFolderSlug(game.name));
+}
+
+export async function composeCenteredOverlay(
+  background: Buffer,
+  overlay: Buffer,
+): Promise<Buffer> {
+  const metadata = await sharp(background).metadata();
+  const width = metadata.width ?? 0;
+  const height = metadata.height ?? 0;
+  if (!width || !height) throw new Error("composition_missing_background_dimensions");
+
+  const fittedOverlay = await sharp(overlay)
+    .resize({
+      width: Math.max(1, Math.floor(width * 0.8)),
+      height: Math.max(1, Math.floor(height * 0.72)),
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .png()
+    .toBuffer();
+
+  return sharp(background)
+    .composite([{ input: fittedOverlay, gravity: "center" }])
+    .toBuffer();
 }
 
 export interface SaveImageResult {
@@ -231,31 +256,84 @@ async function persistValidatedBuffer(options: {
   gameMatchScore: number;
   imageCandidateScore: number;
   overwrite?: boolean;
+  missingOnly?: boolean;
   preferType?: ImageType;
+  forceType?: ImageType;
   allowOther?: boolean;
+  allowCrossGameDuplicate?: boolean;
+  minWidth?: number;
+  minHeight?: number;
+  squareMinRatio?: number;
+  squareMaxRatio?: number;
+  landscapeMaxRatio?: number;
+  allowSameNameDuplicate?: boolean;
   upsertFn?: UpsertFn;
 }): Promise<SaveImageResult> {
-  const hash = sha256(options.buffer);
-  let inspection;
+  let sourceInspection;
   try {
-    inspection = await inspectImage(options.buffer);
+    sourceInspection = await inspectImage(options.buffer);
   } catch (err) {
-    return { saved: false, reason: (err as Error).message, sha256: hash };
+    return {
+      saved: false,
+      reason: (err as Error).message,
+      sha256: sha256(options.buffer),
+    };
   }
 
-  const validation = validateImage(inspection, options.contentType);
+  const validation = validateImage(sourceInspection, options.contentType, {
+    minWidth: options.minWidth,
+    minHeight: options.minHeight,
+  });
   if (!validation.ok) {
     return {
       saved: false,
       reason: validation.reason,
-      imageType: inspection.imageType,
-      width: inspection.width,
-      height: inspection.height,
-      sha256: hash,
+      imageType: sourceInspection.imageType,
+      width: sourceInspection.width,
+      height: sourceInspection.height,
+      sha256: sha256(options.buffer),
     };
   }
 
-  const imageType = inspection.imageType;
+  let outputBuffer: Buffer;
+  try {
+    outputBuffer =
+      sourceInspection.format === "webp"
+        ? options.buffer
+        : await sharp(options.buffer).webp({ quality: 90, alphaQuality: 100, effort: 4 }).toBuffer();
+  } catch (err) {
+    return {
+      saved: false,
+      reason: `webp_conversion_failed: ${(err as Error).message}`,
+      imageType: sourceInspection.imageType,
+      width: sourceInspection.width,
+      height: sourceInspection.height,
+      sha256: sha256(options.buffer),
+    };
+  }
+
+  const inspection =
+    sourceInspection.format === "webp"
+      ? sourceInspection
+      : await inspectImage(outputBuffer);
+  const hash = sha256(outputBuffer);
+  let imageType = options.forceType ?? inspection.imageType;
+  if (
+    imageType === "other" &&
+    options.squareMaxRatio &&
+    inspection.ratio >= (options.squareMinRatio ?? config.ratios.squareMin) &&
+    inspection.ratio <= options.squareMaxRatio
+  ) {
+    imageType = "square";
+  }
+  if (
+    imageType === "other" &&
+    options.landscapeMaxRatio &&
+    inspection.ratio >= config.ratios.landscapeMin &&
+    inspection.ratio <= options.landscapeMaxRatio
+  ) {
+    imageType = "landscape";
+  }
   if (options.preferType && imageType !== options.preferType) {
     return {
       saved: false,
@@ -266,7 +344,7 @@ async function persistValidatedBuffer(options: {
       sha256: hash,
     };
   }
-  if (imageType === "other" && options.preferType !== "other" && !options.allowOther) {
+  if (imageType === "other" && options.preferType !== "other" && !options.forceType && !options.allowOther) {
     return {
       saved: false,
       reason: "wrong_image_type:other",
@@ -274,6 +352,19 @@ async function persistValidatedBuffer(options: {
       width: inspection.width,
       height: inspection.height,
       sha256: hash,
+    };
+  }
+
+  const existing = getImageByType(options.game.id, imageType);
+  if (options.missingOnly && existing) {
+    return {
+      saved: false,
+      reason: "image_type_already_exists",
+      localPath: existing.localPath,
+      imageType,
+      width: existing.width,
+      height: existing.height,
+      sha256: existing.sha256,
     };
   }
 
@@ -290,7 +381,20 @@ async function persistValidatedBuffer(options: {
         sha256: hash,
       };
     }
-    if (existingSameHash.gameId !== options.game.id) {
+    const existingGame =
+      existingSameHash.gameId !== options.game.id
+        ? getGameById(existingSameHash.gameId)
+        : null;
+    const isSameNameDuplicate =
+      Boolean(options.allowSameNameDuplicate) &&
+      Boolean(existingGame) &&
+      normalizeGameName(existingGame?.name ?? "") ===
+        normalizeGameName(options.game.name);
+    if (
+      existingSameHash.gameId !== options.game.id &&
+      !options.allowCrossGameDuplicate &&
+      !isSameNameDuplicate
+    ) {
       return {
         saved: false,
         reason: "cross_game_duplicate",
@@ -303,7 +407,6 @@ async function persistValidatedBuffer(options: {
     }
   }
 
-  const existing = getImageByType(options.game.id, imageType);
   if (existing && !options.overwrite) {
     const existingPixels = existing.width * existing.height;
     const newPixels = inspection.width * inspection.height;
@@ -320,15 +423,15 @@ async function persistValidatedBuffer(options: {
     }
   }
 
-  const ext = extensionFromFormat(inspection.format, options.contentType, options.sourceUrl);
-  const localPath = path.join(gameImageDir(options.game), `${imageType}.${ext}`);
+  const ext = "webp";
+  const localPath = path.join(gameImageDir(options.game), `${imageType}.webp`);
   const previousPath = existing?.localPath
     ? path.isAbsolute(existing.localPath)
       ? existing.localPath
       : path.resolve(process.cwd(), existing.localPath)
     : null;
 
-  const plan = stageNativeImageFile(localPath, options.buffer, previousPath);
+  const plan = stageNativeImageFile(localPath, outputBuffer, previousPath);
   const upsert = options.upsertFn ?? upsertGameImage;
 
   let result: UpsertGameImageResult;
@@ -340,7 +443,7 @@ async function persistValidatedBuffer(options: {
       width: inspection.width,
       height: inspection.height,
       format: ext,
-      fileSize: options.buffer.length,
+      fileSize: outputBuffer.length,
       source: options.source,
       sha256: hash,
       gameMatchScore: options.gameMatchScore,
@@ -385,26 +488,53 @@ export async function downloadAndStoreImage(options: {
   gameMatchScore: number;
   imageCandidateScore: number;
   overwrite?: boolean;
+  missingOnly?: boolean;
   proxy?: string;
   preferType?: ImageType;
+  forceType?: ImageType;
   allowOther?: boolean;
+  allowCrossGameDuplicate?: boolean;
+  minWidth?: number;
+  minHeight?: number;
+  squareMinRatio?: number;
+  squareMaxRatio?: number;
+  landscapeMaxRatio?: number;
+  allowSameNameDuplicate?: boolean;
+  overlayUrl?: string | null;
   upsertFn?: UpsertFn;
 }): Promise<SaveImageResult> {
   const downloaded = await fetchBuffer(options.url, {
     proxy: options.proxy,
     label: `image:${options.source}`,
   });
+  let buffer = downloaded.buffer;
+  if (options.overlayUrl) {
+    const overlay = await fetchBuffer(options.overlayUrl, {
+      proxy: options.proxy,
+      label: `image:${options.source}:overlay`,
+    });
+    buffer = await composeCenteredOverlay(buffer, overlay.buffer);
+  }
   return persistValidatedBuffer({
     game: options.game,
-    buffer: downloaded.buffer,
+    buffer,
     contentType: downloaded.contentType,
     sourceUrl: downloaded.finalUrl,
     source: options.source,
     gameMatchScore: options.gameMatchScore,
     imageCandidateScore: options.imageCandidateScore,
     overwrite: options.overwrite,
+    missingOnly: options.missingOnly,
     preferType: options.preferType,
+    forceType: options.forceType,
     allowOther: options.allowOther,
+    allowCrossGameDuplicate: options.allowCrossGameDuplicate,
+    minWidth: options.minWidth,
+    minHeight: options.minHeight,
+    squareMinRatio: options.squareMinRatio,
+    squareMaxRatio: options.squareMaxRatio,
+    landscapeMaxRatio: options.landscapeMaxRatio,
+    allowSameNameDuplicate: options.allowSameNameDuplicate,
     upsertFn: options.upsertFn,
   });
 }
@@ -418,8 +548,17 @@ export async function storeImageBuffer(options: {
   contentType?: string | null;
   fakeUrl?: string;
   overwrite?: boolean;
+  missingOnly?: boolean;
   preferType?: ImageType;
+  forceType?: ImageType;
   allowOther?: boolean;
+  allowCrossGameDuplicate?: boolean;
+  minWidth?: number;
+  minHeight?: number;
+  squareMinRatio?: number;
+  squareMaxRatio?: number;
+  landscapeMaxRatio?: number;
+  allowSameNameDuplicate?: boolean;
   upsertFn?: UpsertFn;
 }): Promise<SaveImageResult> {
   return persistValidatedBuffer({
@@ -431,8 +570,17 @@ export async function storeImageBuffer(options: {
     gameMatchScore: options.gameMatchScore,
     imageCandidateScore: options.imageCandidateScore,
     overwrite: options.overwrite,
+    missingOnly: options.missingOnly,
     preferType: options.preferType,
+    forceType: options.forceType,
     allowOther: options.allowOther,
+    allowCrossGameDuplicate: options.allowCrossGameDuplicate,
+    minWidth: options.minWidth,
+    minHeight: options.minHeight,
+    squareMinRatio: options.squareMinRatio,
+    squareMaxRatio: options.squareMaxRatio,
+    landscapeMaxRatio: options.landscapeMaxRatio,
+    allowSameNameDuplicate: options.allowSameNameDuplicate,
     upsertFn: options.upsertFn,
   });
 }

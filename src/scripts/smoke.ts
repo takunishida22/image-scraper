@@ -87,10 +87,11 @@ const rejected = await storeImageBuffer({
 assert.equal(rejected.saved, false);
 assert.equal(rejected.reason, "wrong_image_type:square");
 
-console.log("5) File naming uniqueness");
+console.log("5) Same-name games share one folder");
 const dragons = games.filter((g) => g.name === "Lucky Dragon");
 assert.equal(dragons.length, 2);
-assert.notEqual(gameImageDir(dragons[0]!), gameImageDir(dragons[1]!));
+assert.equal(gameImageDir(dragons[0]!), gameImageDir(dragons[1]!));
+assert.doesNotMatch(path.basename(gameImageDir(dragons[0]!)), /__\d+$/);
 
 console.log("6) Duplicate detection");
 const gSquare = games.find((g) => g.name === "Smoke Square")!;

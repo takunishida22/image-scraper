@@ -1,14 +1,26 @@
 import { getSourceConfig } from "../config/index.js";
 import type { GameImageSource } from "./SourceAdapter.js";
 import { stakeSource } from "./stake/index.js";
+import { bcgameSource } from "./bcgame/index.js";
+import { betgalianoSource } from "./betgaliano/index.js";
+import { regencycasinoSource } from "./regencycasino/index.js";
+import { databetrixSource } from "./databetrix/index.js";
+import { grosvenorcasinoSource } from "./grosvenorcasino/index.js";
+import { multiwinSource } from "./multiwin/index.js";
 import { slotsjudgeSource } from "./slotsjudge/index.js";
 import { bitcasinoSource } from "./bitcasino/index.js";
 import { slotcatalogSource } from "./slotcatalog/index.js";
 import { casinoguruSource } from "./casinoguru/index.js";
 
 const adapters: GameImageSource[] = [
-  stakeSource,
+  bcgameSource,
+  betgalianoSource,
+  regencycasinoSource,
+  databetrixSource,
+  grosvenorcasinoSource,
+  multiwinSource,
   slotsjudgeSource,
+  stakeSource,
   bitcasinoSource,
   slotcatalogSource,
   casinoguruSource,

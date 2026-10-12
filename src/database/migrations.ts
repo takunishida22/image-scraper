@@ -116,6 +116,31 @@ export function runMigrations(db: DatabaseSync): void {
         `);
       },
     },
+    {
+      name: "003_game_seed_urls",
+      run: (database) => {
+        if (!tableHasColumn(database, "games", "external_id")) {
+          database.exec(`ALTER TABLE games ADD COLUMN external_id TEXT`);
+        }
+        if (!tableHasColumn(database, "games", "img_url")) {
+          database.exec(`ALTER TABLE games ADD COLUMN img_url TEXT`);
+        }
+        if (!tableHasColumn(database, "games", "img_vertical_url")) {
+          database.exec(`ALTER TABLE games ADD COLUMN img_vertical_url TEXT`);
+        }
+        if (!tableHasColumn(database, "games", "img_wide_url")) {
+          database.exec(`ALTER TABLE games ADD COLUMN img_wide_url TEXT`);
+        }
+        if (!tableHasColumn(database, "games", "img_square_url")) {
+          database.exec(`ALTER TABLE games ADD COLUMN img_square_url TEXT`);
+        }
+        database.exec(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_games_external_id
+            ON games (external_id)
+            WHERE external_id IS NOT NULL AND external_id != '';
+        `);
+      },
+    },
   ];
 
   for (const migration of migrations) {

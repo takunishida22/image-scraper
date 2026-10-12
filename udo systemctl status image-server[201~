@@ -1,0 +1,11 @@
+[0;1;32m●[0m image-server.service - Casino Image Server
+     Loaded: loaded (]8;;file://65-108-10-212.ptr/etc/systemd/system/image-server.service/etc/systemd/system/image-server.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Fri 2026-08-28 13:18:11 UTC; 2 days ago
+   Main PID: 1144994 (node)
+      Tasks: 11 (limit: 308656)
+     Memory: 51.4M (peak: 84.6M)
+        CPU: 30.796s
+     CGroup: /system.slice/image-server.service
+             └─[0;38;5;245m1144994 /root/.nvm/versions/node/v22.22.2/bin/node /root/development/Adaa-workspace/image-scraper/image-server/server.mjs[0m
+
+Notice: journal has been rotated since unit was started, output may be incomplete.

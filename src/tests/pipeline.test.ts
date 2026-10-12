@@ -82,7 +82,92 @@ test("ratio enforcement: prefer portrait rejects square", async () => {
   });
 });
 
-test("native bytes preserved: saved hash equals input hash", async () => {
+test("source-specific square ratio accepts near-square lobby tiles", async () => {
+  await withTempEnv(async () => {
+    const { getDb, importGames, listGames } = await import("../database/db.js");
+    const { storeImageBuffer } = await import("../images/downloader.js");
+    getDb();
+    importGames([{ name: "Near Square Game", provider: "A" }]);
+    const game = listGames({})[0]!;
+    const result = await storeImageBuffer({
+      game,
+      buffer: await makeImage(496, 420, "png"),
+      source: "test",
+      gameMatchScore: 100,
+      imageCandidateScore: 50,
+      squareMaxRatio: 1.3,
+    });
+    assert.equal(result.saved, true);
+    assert.equal(result.imageType, "square");
+  });
+});
+
+test("source-specific bounds classify Multiwin tile and banner ratios", async () => {
+  await withTempEnv(async () => {
+    const { getDb, importGames, listGames } = await import("../database/db.js");
+    const { storeImageBuffer } = await import("../images/downloader.js");
+    getDb();
+    importGames([
+      { name: "Near Square Multiwin", provider: "A" },
+      { name: "Wide Multiwin", provider: "A" },
+    ]);
+    const [nearSquare, wide] = listGames({});
+
+    const squareResult = await storeImageBuffer({
+      game: nearSquare!,
+      buffer: await makeImage(887, 1000, "png"),
+      source: "test",
+      gameMatchScore: 100,
+      imageCandidateScore: 50,
+      squareMinRatio: 0.85,
+      squareMaxRatio: 1.2,
+    });
+    const landscapeResult = await storeImageBuffer({
+      game: wide!,
+      buffer: await makeImage(1200, 200, "png"),
+      source: "test",
+      gameMatchScore: 100,
+      imageCandidateScore: 50,
+      landscapeMaxRatio: 10,
+    });
+
+    assert.equal(squareResult.imageType, "square");
+    assert.equal(landscapeResult.imageType, "landscape");
+  });
+});
+
+test("same-name records may store duplicate bytes when explicitly allowed", async () => {
+  await withTempEnv(async () => {
+    const { getDb, importGames, listGames } = await import("../database/db.js");
+    const { storeImageBuffer } = await import("../images/downloader.js");
+    getDb();
+    importGames([
+      { name: "Shared Name", provider: "Provider A" },
+      { name: "Shared Name", provider: "Provider B" },
+    ]);
+    const [first, second] = listGames({});
+    const buffer = await makeImage(400, 400, "png");
+    const savedFirst = await storeImageBuffer({
+      game: first!,
+      buffer,
+      source: "test",
+      gameMatchScore: 100,
+      imageCandidateScore: 50,
+    });
+    const savedSecond = await storeImageBuffer({
+      game: second!,
+      buffer,
+      source: "test",
+      gameMatchScore: 100,
+      imageCandidateScore: 50,
+      allowSameNameDuplicate: true,
+    });
+    assert.equal(savedFirst.saved, true);
+    assert.equal(savedSecond.saved, true);
+  });
+});
+
+test("input images are converted and saved as WebP", async () => {
   await withTempEnv(async () => {
     const { getDb, importGames, listGames } = await import("../database/db.js");
     const { storeImageBuffer } = await import("../images/downloader.js");
@@ -91,7 +176,6 @@ test("native bytes preserved: saved hash equals input hash", async () => {
     importGames([{ name: "Native Bytes", provider: "A" }]);
     const game = listGames({})[0]!;
     const buf = await makeImage(300, 450, "png");
-    const inputHash = sha256(buf);
     const result = await storeImageBuffer({
       game,
       buffer: buf,
@@ -101,10 +185,12 @@ test("native bytes preserved: saved hash equals input hash", async () => {
       preferType: "portrait",
     });
     assert.equal(result.saved, true);
-    assert.equal(result.sha256, inputHash);
     assert.ok(result.localPath);
+    assert.ok(result.localPath!.endsWith(".webp"));
     const saved = fs.readFileSync(path.resolve(result.localPath!));
-    assert.equal(sha256(saved), inputHash);
+    assert.equal(sha256(saved), result.sha256);
+    const metadata = await sharp(saved).metadata();
+    assert.equal(metadata.format, "webp");
   });
 });
 
@@ -119,7 +205,7 @@ test("extension follows actual bytes not URL", async () => {
   });
 });
 
-test("game path collision: same name different ids get different dirs", async () => {
+test("same game name shares one image folder without a game-id suffix", async () => {
   await withTempEnv(async () => {
     const { getDb, importGames, listGames } = await import("../database/db.js");
     const { gameImageDir, storeImageBuffer } = await import("../images/downloader.js");
@@ -132,8 +218,9 @@ test("game path collision: same name different ids get different dirs", async ()
     assert.equal(games.length, 2);
     const dirA = gameImageDir(games[0]!);
     const dirB = gameImageDir(games[1]!);
-    assert.notEqual(dirA, dirB);
-    assert.match(path.basename(dirA), /__\d+$/);
+    assert.equal(dirA, dirB);
+    assert.equal(path.basename(dirA), "Lucky-dragon");
+    assert.doesNotMatch(path.basename(dirA), /__\d+$/);
 
     const buf = await makeImage(300, 450, "png");
     await storeImageBuffer({
@@ -152,8 +239,7 @@ test("game path collision: same name different ids get different dirs", async ()
       imageCandidateScore: 40,
       preferType: "portrait",
     });
-    assert.ok(fs.existsSync(path.join(dirA, "portrait.png")));
-    assert.ok(fs.existsSync(path.join(dirB, "portrait.png")));
+    assert.ok(fs.existsSync(path.join(dirA, "portrait.webp")));
   });
 });
 
@@ -309,9 +395,14 @@ test("srcset prefers highest native width descriptor", async () => {
     const game = {
       id: 1,
       name: "Srcset Game",
-      normalizedName: "srcset game",
+      normalizedName: "Srcset-game",
       provider: null,
       status: "pending" as const,
+      externalId: null,
+      imgUrl: null,
+      imgVerticalUrl: null,
+      imgWideUrl: null,
+      imgSquareUrl: null,
       createdAt: "",
       updatedAt: "",
     };
@@ -381,7 +472,6 @@ test("DB failure during same-path replacement restores old image", async () => {
     const game = listGames({})[0]!;
 
     const original = await makeImage(300, 400, "png");
-    const originalHash = sha256(original);
     const first = await storeImageBuffer({
       game,
       buffer: original,
@@ -393,7 +483,7 @@ test("DB failure during same-path replacement restores old image", async () => {
     assert.equal(first.saved, true);
     const before = getImageByType(game.id, "portrait")!;
     const filePath = path.resolve(before.localPath);
-    assert.equal(sha256(fs.readFileSync(filePath)), originalHash);
+    assert.equal(sha256(fs.readFileSync(filePath)), before.sha256);
 
     const bigger = await makeImage(600, 800, "png");
     const failed = await storeImageBuffer({
@@ -411,9 +501,9 @@ test("DB failure during same-path replacement restores old image", async () => {
     assert.match(failed.reason ?? "", /db_update_failed/);
 
     const after = getImageByType(game.id, "portrait")!;
-    assert.equal(after.sha256, originalHash);
+    assert.equal(after.sha256, before.sha256);
     assert.equal(after.width, 300);
-    assert.equal(sha256(fs.readFileSync(filePath)), originalHash);
+    assert.equal(sha256(fs.readFileSync(filePath)), before.sha256);
     // No leftover backups in game dir
     const leftovers = fs.readdirSync(gameImageDir(game)).filter((n) => n.includes(".bak.") || n.endsWith(".tmp"));
     assert.equal(leftovers.length, 0);
@@ -424,7 +514,6 @@ test("cross-game duplicate continues to next unique candidate", async () => {
   await withTempEnv(async () => {
     const { getDb, importGames, listGames, getImageByType } = await import("../database/db.js");
     const { storeImageBuffer } = await import("../images/downloader.js");
-    const { sha256 } = await import("../images/inspector.js");
     getDb();
     importGames([
       { name: "Dup Host", provider: "A" },
@@ -448,6 +537,7 @@ test("cross-game duplicate continues to next unique candidate", async () => {
     // Mirrors scraper candidate loop: duplicate first, unique second
     const candidates = [dupBuf, uniqueBuf];
     let savedAny = false;
+    let savedHash: string | undefined;
     let sawCrossGameDup = false;
     let lastReason = "unknown";
 
@@ -462,6 +552,7 @@ test("cross-game duplicate continues to next unique candidate", async () => {
       });
       if (saved.saved) {
         savedAny = true;
+        savedHash = saved.sha256;
         break;
       }
       lastReason = saved.reason ?? "not_saved";
@@ -476,8 +567,7 @@ test("cross-game duplicate continues to next unique candidate", async () => {
     assert.equal(lastReason === "cross_game_duplicate" || savedAny, true);
     const record = getImageByType(target.id, "portrait");
     assert.ok(record);
-    assert.equal(record!.sha256, sha256(uniqueBuf));
-    assert.notEqual(record!.sha256, sha256(dupBuf));
+    assert.equal(record!.sha256, savedHash);
   });
 });
 
